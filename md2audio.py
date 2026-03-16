@@ -87,12 +87,25 @@ def synthesize(
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     submaker = edge_tts.SubMaker()
 
+    total_chars = len(text)
+    written_bytes = 0
+    last_pct = -1
+
     with open(output_path, "wb") as f:
         for chunk in communicate.stream_sync():
             if chunk["type"] == "audio":
                 f.write(chunk["data"])
+                written_bytes += len(chunk["data"])
             elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
                 submaker.feed(chunk)
+                offset = chunk.get("offset", 0)
+                pct = min(int(offset / total_chars * 100), 99) if total_chars else 0
+                if pct > last_pct:
+                    last_pct = pct
+                    mb = written_bytes / (1024 * 1024)
+                    print(f"\r  [{pct:3d}%] {mb:.1f} MB written", end="", flush=True)
+
+    print(f"\r  [100%] {written_bytes / (1024 * 1024):.1f} MB written")
 
     if srt_path:
         srt_content = submaker.get_srt()
