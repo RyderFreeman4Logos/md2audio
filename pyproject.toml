@@ -1,0 +1,11 @@
+[project]
+name = "md2audio"
+version = "0.1.0"
+description = "Convert markdown files to audio with subtitles and video, powered by edge-tts"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["edge-tts>=7.0"]
+
+[project.scripts]
+md2audio = "md2audio:main"
