@@ -88,6 +88,7 @@ def synthesize(
     submaker = edge_tts.SubMaker()
 
     total_chars = len(text)
+    processed_chars = 0
     written_bytes = 0
     last_pct = -1
 
@@ -98,8 +99,8 @@ def synthesize(
                 written_bytes += len(chunk["data"])
             elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
                 submaker.feed(chunk)
-                offset = chunk.get("offset", 0)
-                pct = min(int(offset / total_chars * 100), 99) if total_chars else 0
+                processed_chars += len(chunk.get("text", ""))
+                pct = min(int(processed_chars / total_chars * 100), 99) if total_chars else 0
                 if pct > last_pct:
                     last_pct = pct
                     mb = written_bytes / (1024 * 1024)
