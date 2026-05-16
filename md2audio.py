@@ -177,18 +177,20 @@ def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
 # Video generation
 # ---------------------------------------------------------------------------
 
-def _pick_codec() -> list[str]:
-    """Prefer NVENC hardware encoding; fall back to libx264."""
+_CODEC_NVENC = ["-c:v", "hevc_nvenc", "-b:v", "0", "-cq", "30", "-preset", "p6"]
+_CODEC_X264 = ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
+
+
+def _nvenc_available() -> bool:
+    """Check if hevc_nvenc encoder is listed by ffmpeg."""
     try:
         r = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=5,
         )
-        if "hevc_nvenc" in r.stdout:
-            return ["-c:v", "hevc_nvenc", "-b:v", "0", "-cq", "30", "-preset", "p6"]
+        return "hevc_nvenc" in r.stdout
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
+        return False
 
 
 def generate_video(audio: Path, video: Path, srt: Path | None = None) -> None:
@@ -204,18 +206,22 @@ def generate_video(audio: Path, video: Path, srt: Path | None = None) -> None:
         "[bg][waves]overlay=format=auto,format=yuv420p[v]"
     )
 
-    cmd = [
-        "ffmpeg", "-i", str(audio),
-        "-filter_complex", filt,
-        "-map", "[v]", "-map", "0:a",
-        *_pick_codec(),
-        "-c:a", "aac", "-b:a", "192k",
-        "-shortest", "-y", str(video),
-    ]
+    codecs_to_try = [_CODEC_NVENC, _CODEC_X264] if _nvenc_available() else [_CODEC_X264]
 
-    print("  Encoding video...")
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
+    for codec in codecs_to_try:
+        cmd = [
+            "ffmpeg", "-i", str(audio),
+            "-filter_complex", filt,
+            "-map", "[v]", "-map", "0:a",
+            *codec,
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest", "-y", str(video),
+        ]
+        print(f"  Encoding video ({codec[1]})...")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            break
+    else:
         print(f"ffmpeg error:\n{r.stderr[-500:]}", file=sys.stderr)
         sys.exit(1)
 
@@ -335,7 +341,7 @@ def _cmd_bundle(args) -> None:
 
 def main() -> None:
     _commands = {"synth", "bundle"}
-    if len(sys.argv) > 1 and sys.argv[1] not in _commands and not sys.argv[1].startswith("-"):
+    if not any(a in _commands for a in sys.argv[1:]):
         sys.argv.insert(1, "synth")
 
     top = argparse.ArgumentParser(
