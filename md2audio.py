@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import edge_tts
@@ -62,6 +63,14 @@ def _fmt_srt_time(ticks: int) -> str:
     m, s = divmod(s, 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _fmt_eta(secs: float) -> str:
+    s = int(secs)
+    if s < 3600:
+        return f"{s // 60}:{s % 60:02d}"
+    h, rem = divmod(s, 3600)
+    return f"{h}:{rem // 60:02d}:{rem % 60:02d}"
 
 
 def _split_at_breaks(text: str) -> list[str]:
@@ -148,6 +157,7 @@ def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
     written = 0
     pct = -1
     bounds: list[dict] = []
+    t0 = time.monotonic()
 
     with open(output, "wb") as f:
         for chunk in comm.stream_sync():
@@ -165,9 +175,15 @@ def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
                 if p > pct:
                     pct = p
                     mb = written / (1024 * 1024)
-                    print(f"\r  [{pct:3d}%] {mb:.1f} MB", end="", flush=True)
+                    elapsed = time.monotonic() - t0
+                    eta = elapsed / pct * (100 - pct) if pct > 0 else 0
+                    eta_s = f"~{_fmt_eta(eta)}" if pct > 0 else "?"
+                    line = f"  [{pct:3d}%] {mb:.1f} MB  {_fmt_eta(elapsed)} / {eta_s}"
+                    print(f"\r{line:<50}", end="", flush=True)
 
-    print(f"\r  [100%] {written / (1024 * 1024):.1f} MB")
+    elapsed = time.monotonic() - t0
+    line = f"  [100%] {written / (1024 * 1024):.1f} MB  total {_fmt_eta(elapsed)}"
+    print(f"\r{line:<50}")
     return bounds
 
 
@@ -216,14 +232,18 @@ def generate_video(audio: Path, video: Path, srt: Path | None = None) -> None:
             "-shortest", "-y", str(video),
         ]
         print(f"  Encoding video ({codec[1]})...")
+        t0_enc = time.monotonic()
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode == 0:
+            print(f"  Encoded in {_fmt_eta(time.monotonic() - t0_enc)}")
             break
     else:
         print(f"ffmpeg error:\n{r.stderr[-500:]}", file=sys.stderr)
         sys.exit(1)
 
     if srt and srt.exists():
+        print("  Burning subtitles...")
+        t0_sub = time.monotonic()
         tmp = video.with_suffix(".tmp.mp4")
         sub_cmd = [
             "ffmpeg", "-i", str(video),
@@ -232,6 +252,7 @@ def generate_video(audio: Path, video: Path, srt: Path | None = None) -> None:
         ]
         r = subprocess.run(sub_cmd, capture_output=True, text=True)
         if r.returncode == 0:
+            print(f"  Subtitles burned in {_fmt_eta(time.monotonic() - t0_sub)}")
             tmp.replace(video)
         else:
             print("  Warning: could not burn subtitles into video", file=sys.stderr)
