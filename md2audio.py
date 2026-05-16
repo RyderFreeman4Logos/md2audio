@@ -11,6 +11,9 @@ import edge_tts
 
 DEFAULT_VOICE = "zh-CN-YunyangNeural"
 DEFAULT_SPEED = 1.0
+_SRT_MAX_CHARS = 35
+_SRT_MIN_CHARS = 10
+_SRT_SPLIT_TARGET = 20
 
 
 # ---------------------------------------------------------------------------
@@ -19,218 +22,351 @@ DEFAULT_SPEED = 1.0
 
 def strip_markdown(text: str) -> str:
     """Remove markdown syntax, keeping readable plain text."""
-    # Remove reference/citation sections and everything after
     text = re.split(
         r"^#{1,6}\s*\**(?:引用的著作|参考文献|References?|Bibliography)\**\s*$",
         text, maxsplit=1, flags=re.MULTILINE | re.IGNORECASE,
     )[0]
 
-    # Remove code blocks
     text = re.sub(r"```[\s\S]*?```", "", text)
 
-    # Remove markdown tables
     text = re.sub(r"^\|.*\|$", "", text, flags=re.MULTILINE)
     text = re.sub(r"^[\s|:\-]+$", "", text, flags=re.MULTILINE)
 
-    # Remove images
     text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
-
-    # Remove links, keep text
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-    # Remove bare URLs
     text = re.sub(r"https?://\S+", "", text)
 
-    # Remove headings markers but keep text
     text = re.sub(r"^#{1,6}\s*\**(.+?)\**\s*$", r"\1", text, flags=re.MULTILINE)
-
-    # Remove bold/italic markers
     text = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", text)
-
-    # Remove inline code
     text = re.sub(r"`([^`]+)`", r"\1", text)
 
-    # Remove footnote references (superscript numbers)
     text = re.sub(r"\s+\d+(?:(?:,\s*|\s*)\d+)*(?=[\s。，,.;；])", "", text)
 
-    # Remove bullet markers
     text = re.sub(r"^\s*[\*\-]\s+", "", text, flags=re.MULTILINE)
-
-    # Remove numbered list markers
     text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
 
-    # Remove horizontal rules
     text = re.sub(r"^---+$", "", text, flags=re.MULTILINE)
-
-    # Remove HTML tags
     text = re.sub(r"<[^>]+>", "", text)
 
-    # Collapse multiple blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# TTS synthesis (audio + subtitles in one pass)
+# SRT subtitle generation
 # ---------------------------------------------------------------------------
 
-def synthesize(
-    text: str,
-    voice: str,
-    speed: float,
-    output_path: Path,
-    srt_path: Path | None = None,
-) -> None:
-    """Synthesize audio via edge-tts, optionally generating SRT subtitles."""
+def _fmt_srt_time(ticks: int) -> str:
+    """Convert 100-nanosecond ticks to SRT time format HH:MM:SS,mmm."""
+    ms = ticks // 10_000
+    s, ms = divmod(ms, 1000)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _split_at_breaks(text: str) -> list[str]:
+    """Split long text at clause-break punctuation, targeting _SRT_SPLIT_TARGET chars per chunk."""
+    breaks = frozenset("，、；,;:：—")
+    chunks: list[str] = []
+    buf = ""
+
+    for char in text:
+        buf += char
+        if len(buf) >= _SRT_SPLIT_TARGET and char in breaks:
+            chunks.append(buf)
+            buf = ""
+
+    if buf:
+        if chunks and len(buf) < _SRT_MIN_CHARS:
+            chunks[-1] += buf
+        else:
+            chunks.append(buf)
+
+    result: list[str] = []
+    for chunk in (chunks or [text]):
+        while len(chunk) > _SRT_MAX_CHARS * 2:
+            result.append(chunk[:_SRT_MAX_CHARS])
+            chunk = chunk[_SRT_MAX_CHARS:]
+        result.append(chunk)
+    return result
+
+
+def build_quality_srt(boundaries: list[dict]) -> str:
+    """Build well-segmented SRT from TTS boundary events.
+
+    Each boundary (sentence or word) becomes one or more subtitle blocks.
+    Long blocks are split at clause-break punctuation; short ones are
+    merged with the next block to keep subtitle length moderate.
+    """
+    if not boundaries:
+        return ""
+
+    raw: list[tuple[int, int, str]] = []
+    for b in boundaries:
+        text = b["text"].strip()
+        if not text:
+            continue
+        start, dur = b["offset"], b["duration"]
+        if len(text) <= _SRT_MAX_CHARS:
+            raw.append((start, start + dur, text))
+        else:
+            chunks = _split_at_breaks(text)
+            total = len(text)
+            pos = 0
+            for chunk in chunks:
+                t0 = start + int(dur * pos / total)
+                pos += len(chunk)
+                t1 = start + int(dur * pos / total)
+                if chunk.strip():
+                    raw.append((t0, t1, chunk.strip()))
+
+    merged: list[tuple[int, int, str]] = []
+    for s, e, text in raw:
+        if merged and len(merged[-1][2]) < _SRT_MIN_CHARS:
+            ps, _, pt = merged[-1]
+            merged[-1] = (ps, e, pt + text)
+        else:
+            merged.append((s, e, text))
+
+    parts: list[str] = []
+    for idx, (s, e, text) in enumerate(merged, 1):
+        parts.append(f"{idx}\n{_fmt_srt_time(s)} --> {_fmt_srt_time(e)}\n{text}\n")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# TTS synthesis
+# ---------------------------------------------------------------------------
+
+def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
+    """Synthesize audio via edge-tts, returning word-boundary timing data."""
     rate = f"{int((speed - 1) * 100):+d}%"
-    communicate = edge_tts.Communicate(text, voice, rate=rate)
-    submaker = edge_tts.SubMaker()
+    comm = edge_tts.Communicate(text, voice, rate=rate)
 
-    total_chars = len(text)
-    processed_chars = 0
-    written_bytes = 0
-    last_pct = -1
+    total = len(text)
+    chars = 0
+    written = 0
+    pct = -1
+    bounds: list[dict] = []
 
-    with open(output_path, "wb") as f:
-        for chunk in communicate.stream_sync():
+    with open(output, "wb") as f:
+        for chunk in comm.stream_sync():
             if chunk["type"] == "audio":
                 f.write(chunk["data"])
-                written_bytes += len(chunk["data"])
+                written += len(chunk["data"])
             elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
-                submaker.feed(chunk)
-                processed_chars += len(chunk.get("text", ""))
-                pct = min(int(processed_chars / total_chars * 100), 99) if total_chars else 0
-                if pct > last_pct:
-                    last_pct = pct
-                    mb = written_bytes / (1024 * 1024)
-                    print(f"\r  [{pct:3d}%] {mb:.1f} MB written", end="", flush=True)
+                bounds.append({
+                    "offset": chunk["offset"],
+                    "duration": chunk["duration"],
+                    "text": chunk.get("text", ""),
+                })
+                chars += len(chunk.get("text", ""))
+                p = min(int(chars / total * 100), 99) if total else 0
+                if p > pct:
+                    pct = p
+                    mb = written / (1024 * 1024)
+                    print(f"\r  [{pct:3d}%] {mb:.1f} MB", end="", flush=True)
 
-    print(f"\r  [100%] {written_bytes / (1024 * 1024):.1f} MB written")
-
-    if srt_path:
-        srt_content = submaker.get_srt()
-        if srt_content:
-            srt_path.write_text(srt_content, encoding="utf-8")
+    print(f"\r  [100%] {written / (1024 * 1024):.1f} MB")
+    return bounds
 
 
 # ---------------------------------------------------------------------------
 # Video generation
 # ---------------------------------------------------------------------------
 
-def generate_video(audio_path: Path, video_path: Path, srt_path: Path | None = None) -> None:
-    """Generate video with waveform visualization from audio."""
+_CODEC_NVENC = ["-c:v", "hevc_nvenc", "-b:v", "0", "-cq", "30", "-preset", "p6"]
+_CODEC_X264 = ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
+
+
+def _nvenc_available() -> bool:
+    """Check if hevc_nvenc encoder is listed by ffmpeg."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "hevc_nvenc" in r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def generate_video(audio: Path, video: Path, srt: Path | None = None) -> None:
+    """Generate waveform video from audio, optionally burning in subtitles."""
     if not shutil.which("ffmpeg"):
-        print("Error: ffmpeg not found, cannot generate video", file=sys.stderr)
+        print("Error: ffmpeg not found", file=sys.stderr)
         sys.exit(1)
 
-    filter_complex = (
+    filt = (
         "[0:a]showwaves=s=1280x720:mode=cline:rate=30"
         ":colors=0x4a90d9@0.8|0x7ec8e3@0.6:scale=sqrt[waves];"
         "color=c=0x1a1a2e:s=1280x720:r=30[bg];"
-        "[bg][waves]overlay=format=auto[v]"
+        "[bg][waves]overlay=format=auto,format=yuv420p[v]"
     )
 
-    cmd = [
-        "ffmpeg", "-i", str(audio_path),
-        "-filter_complex", filter_complex,
-        "-map", "[v]", "-map", "0:a",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-        "-c:a", "aac", "-b:a", "192k",
-        "-shortest", "-y", str(video_path),
-    ]
+    codecs_to_try = [_CODEC_NVENC, _CODEC_X264] if _nvenc_available() else [_CODEC_X264]
 
-    print("Generating video (this may take a while)...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"ffmpeg error:\n{result.stderr[-500:]}", file=sys.stderr)
+    for codec in codecs_to_try:
+        cmd = [
+            "ffmpeg", "-i", str(audio),
+            "-filter_complex", filt,
+            "-map", "[v]", "-map", "0:a",
+            *codec,
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest", "-y", str(video),
+        ]
+        print(f"  Encoding video ({codec[1]})...")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            break
+    else:
+        print(f"ffmpeg error:\n{r.stderr[-500:]}", file=sys.stderr)
         sys.exit(1)
 
-    # Burn in subtitles if available
-    if srt_path and srt_path.exists():
-        tmp_video = video_path.with_suffix(".tmp.mp4")
+    if srt and srt.exists():
+        tmp = video.with_suffix(".tmp.mp4")
         sub_cmd = [
-            "ffmpeg", "-i", str(video_path),
-            "-vf", f"subtitles={srt_path}:force_style='FontSize=24,PrimaryColour=&Hffffff&'",
-            "-c:a", "copy", "-y", str(tmp_video),
+            "ffmpeg", "-i", str(video),
+            "-vf", f"subtitles={srt}:force_style='FontSize=24,PrimaryColour=&Hffffff&'",
+            "-c:a", "copy", "-y", str(tmp),
         ]
-        result = subprocess.run(sub_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            tmp_video.replace(video_path)
+        r = subprocess.run(sub_cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            tmp.replace(video)
         else:
-            print("Warning: failed to burn subtitles into video", file=sys.stderr)
-            tmp_video.unlink(missing_ok=True)
+            print("  Warning: could not burn subtitles into video", file=sys.stderr)
+            tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI helpers
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="md2audio",
-        description="Convert markdown/text files to audio, with optional subtitles and video.",
-    )
-    parser.add_argument("input", type=Path, help="Input file (markdown or plain text)")
-    parser.add_argument("-o", "--output", type=Path,
-                        help="Output audio file (default: ~/w/<stem>.mp3)")
+def _add_common(p: argparse.ArgumentParser) -> None:
+    """Register arguments shared by synth and bundle subcommands."""
+    p.add_argument("input", type=Path, help="Input file (markdown or plain text)")
+    p.add_argument("-o", "--output", type=Path,
+                   help="Output audio file (default: ~/w/<stem>.mp3)")
+    g = p.add_argument_group("TTS")
+    g.add_argument("--voice", default=DEFAULT_VOICE,
+                   help=f"Voice (default: {DEFAULT_VOICE})")
+    g.add_argument("--speed", type=float, default=DEFAULT_SPEED,
+                   help=f"Speed multiplier (default: {DEFAULT_SPEED})")
+    g = p.add_argument_group("Processing")
+    g.add_argument("--no-strip", action="store_true",
+                   help="Don't strip markdown formatting")
 
-    # TTS options
-    tts = parser.add_argument_group("TTS options")
-    tts.add_argument("--voice", default=DEFAULT_VOICE, help=f"Voice name (default: {DEFAULT_VOICE})")
-    tts.add_argument("--speed", type=float, default=DEFAULT_SPEED,
-                     help=f"Speech speed multiplier (default: {DEFAULT_SPEED})")
 
-    # Output options
-    out = parser.add_argument_group("Output options")
-    out.add_argument("--srt", action="store_true", default=False,
-                     help="Also generate SRT subtitles")
-    out.add_argument("--video", action="store_true", default=False,
-                     help="Also generate MP4 video with waveform visualization")
-
-    # Processing toggles (on by default, use --no-X to disable)
-    proc = parser.add_argument_group("Processing (enabled by default)")
-    proc.add_argument("--no-strip", action="store_true",
-                      help="Don't strip markdown formatting")
-
-    args = parser.parse_args()
-
+def _resolve(args) -> tuple[Path, str]:
+    """Validate input, resolve output path, read and process text."""
     if not args.input.exists():
         print(f"Error: {args.input} not found", file=sys.stderr)
         sys.exit(1)
-
-    stem = args.input.stem
-    output = args.output or Path.home() / "w" / f"{stem}.mp3"
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    # Read and process text
+    out = args.output or Path.home() / "w" / f"{args.input.stem}.mp3"
+    out.parent.mkdir(parents=True, exist_ok=True)
     raw = args.input.read_text(encoding="utf-8")
     text = raw if args.no_strip else strip_markdown(raw)
+    print(f"Input:  {args.input} ({len(raw)} chars → {len(text)} after processing)")
+    return out, text
 
-    print(f"Input:  {args.input} ({len(raw)} chars)")
-    print(f"Text:   {len(text)} chars (after processing)")
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def _cmd_synth(args) -> None:
+    """Synthesize audio, with optional SRT and video."""
+    out, text = _resolve(args)
+    srt_out = out.with_suffix(".srt") if args.srt else None
+
     print(f"Voice:  {args.voice} @ {args.speed}x")
-    print(f"Output: {output}")
+    print(f"Output: {out}")
+    print("Synthesizing..." + (" (with subtitles)" if srt_out else ""))
 
-    # Generate audio (and subtitles in the same pass)
-    srt_path = output.with_suffix(".srt") if args.srt else None
-    print("Synthesizing..." + (" (with subtitles)" if srt_path else ""))
-    synthesize(text, args.voice, args.speed, output, srt_path)
+    bounds = synthesize(text, args.voice, args.speed, out)
+    print(f"Audio:  {out.stat().st_size / (1024 * 1024):.1f} MB")
 
-    size_mb = output.stat().st_size / (1024 * 1024)
-    print(f"Audio: {size_mb:.1f} MB")
-    if srt_path and srt_path.exists():
-        print(f"Subtitles: {srt_path}")
+    if srt_out:
+        srt_content = build_quality_srt(bounds)
+        if srt_content:
+            srt_out.write_text(srt_content, encoding="utf-8")
+            print(f"SRT:    {srt_content.count(' --> ')} blocks → {srt_out}")
 
-    # Generate video
     if args.video:
-        video_path = output.with_suffix(".mp4")
-        generate_video(output, video_path, srt_path if srt_path and srt_path.exists() else None)
-        if video_path.exists():
-            vid_mb = video_path.stat().st_size / (1024 * 1024)
-            print(f"Video: {vid_mb:.1f} MB → {video_path}")
+        vp = out.with_suffix(".mp4")
+        generate_video(out, vp, srt_out if srt_out and srt_out.exists() else None)
+        if vp.exists():
+            print(f"Video:  {vp.stat().st_size / (1024 * 1024):.1f} MB → {vp}")
 
     print("Done!")
+
+
+def _cmd_bundle(args) -> None:
+    """Generate audio + SRT subtitles + waveform video in one step."""
+    out, text = _resolve(args)
+    srt_path = out.with_suffix(".srt")
+    vid_path = out.with_suffix(".mp4")
+
+    print(f"Voice:  {args.voice} @ {args.speed}x")
+    print(f"Audio:  {out}")
+    print(f"SRT:    {srt_path}")
+    print(f"Video:  {vid_path}")
+
+    print("\n[1/3] Synthesizing audio...")
+    bounds = synthesize(text, args.voice, args.speed, out)
+    print(f"  {out.stat().st_size / (1024 * 1024):.1f} MB")
+
+    print("\n[2/3] Generating subtitles...")
+    srt_content = build_quality_srt(bounds)
+    if srt_content:
+        srt_path.write_text(srt_content, encoding="utf-8")
+        print(f"  {srt_content.count(' --> ')} subtitle blocks")
+    else:
+        print("  Warning: no boundary data from TTS", file=sys.stderr)
+        srt_path = None
+
+    print("\n[3/3] Generating video...")
+    generate_video(out, vid_path, srt_path)
+    if vid_path.exists():
+        print(f"  {vid_path.stat().st_size / (1024 * 1024):.1f} MB")
+
+    print("\nDone!")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    _commands = {"synth", "bundle"}
+    if len(sys.argv) > 1 and sys.argv[1] not in _commands | {"-h", "--help"}:
+        sys.argv.insert(1, "synth")
+
+    top = argparse.ArgumentParser(
+        prog="md2audio",
+        description="Convert markdown/text to audio, subtitles, and video.",
+    )
+    sub = top.add_subparsers(dest="command")
+
+    sp = sub.add_parser("synth", help="Synthesize audio (default when omitted)")
+    _add_common(sp)
+    g = sp.add_argument_group("Extras")
+    g.add_argument("--srt", action="store_true", help="Also generate SRT subtitles")
+    g.add_argument("--video", action="store_true", help="Also generate MP4 video")
+
+    bp = sub.add_parser("bundle", help="Generate audio + SRT + video in one step")
+    _add_common(bp)
+
+    args = top.parse_args()
+    if args.command == "synth":
+        _cmd_synth(args)
+    elif args.command == "bundle":
+        _cmd_bundle(args)
+    else:
+        top.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
