@@ -341,7 +341,7 @@ def _cmd_bundle(args) -> None:
 
 def main() -> None:
     _commands = {"synth", "bundle"}
-    if not any(a in _commands for a in sys.argv[1:]):
+    if len(sys.argv) > 1 and sys.argv[1] not in _commands | {"-h", "--help"}:
         sys.argv.insert(1, "synth")
 
     top = argparse.ArgumentParser(
