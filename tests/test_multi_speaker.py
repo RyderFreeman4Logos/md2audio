@@ -347,7 +347,7 @@ def test_dialogue_async_stream_times_out(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(md2audio.edge_tts, "Communicate", HangingCommunicate)
     monkeypatch.setattr(md2audio, "_DIALOGUE_TURN_TIMEOUT_SECONDS", 0.01)
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(asyncio.TimeoutError):
         md2audio.synthesize_dialogue_segment("text", "voice", 1.0)
 
 
