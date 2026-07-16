@@ -51,6 +51,8 @@ def parse_dialogue(raw_markdown: str) -> list[DialogueTurn]:
     turns: list[DialogueTurn] = []
     for index, match in enumerate(matches, 1):
         speaker = match.group("speaker").strip()
+        if not speaker:
+            raise ValueError("Multi-speaker input contains an empty speaker label.")
         body_end = matches[index].start() if index < len(matches) else len(raw_markdown)
         body = (match.group("text") + raw_markdown[match.end():body_end]).strip()
         if not body:

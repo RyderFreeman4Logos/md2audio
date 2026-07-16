@@ -46,6 +46,11 @@ def test_parse_dialogue_rejects_preamble_and_warns_for_empty_turn() -> None:
     assert turns == [md2audio.DialogueTurn("Guest", "Hello")]
 
 
+def test_parse_dialogue_rejects_whitespace_only_speaker_label() -> None:
+    with pytest.raises(ValueError, match="empty speaker label"):
+        md2audio.parse_dialogue("**    :** Hello")
+
+
 def test_no_strip_keeps_turn_markdown_but_never_speaks_the_label(tmp_path: Path) -> None:
     input_path = tmp_path / "dialogue.md"
     input_path.write_text("**Host:** Hello **bold** world.", encoding="utf-8")
@@ -123,6 +128,11 @@ def test_dialogue_synthesis_concatenates_audio_in_turn_order_and_offsets_srt(
         (b"second", [{"offset": 0, "duration": 10_000_000, "text": "secondword"}]),
     ])
     monkeypatch.setattr(md2audio, "synthesize_dialogue_segment", lambda *_: next(segments))
+    monkeypatch.setattr(
+        md2audio,
+        "_mp3_duration_ticks",
+        lambda audio: 30_000_000 if audio == b"first" else 10_000_000,
+    )
     output = tmp_path / "dialogue.mp3"
 
     boundaries = md2audio.synthesize_dialogue(
@@ -133,8 +143,8 @@ def test_dialogue_synthesis_concatenates_audio_in_turn_order_and_offsets_srt(
     )
 
     assert output.read_bytes() == b"firstsecond"
-    assert boundaries[1]["offset"] == 20_000_000
-    assert "00:00:02,000 --> 00:00:03,000" in md2audio.build_quality_srt(boundaries)
+    assert boundaries[1]["offset"] == 30_000_000
+    assert "00:00:03,000 --> 00:00:04,000" in md2audio.build_quality_srt(boundaries)
 
 
 def test_dialogue_synthesis_keeps_existing_output_when_a_turn_fails(
@@ -186,3 +196,107 @@ def test_single_speaker_cli_still_uses_existing_synthesis_path(
 
     assert calls == [("Hello", md2audio.DEFAULT_VOICE, 1.0, output_path)]
     assert output_path.read_bytes() == b"single-speaker"
+
+
+def test_config_mode_synthesizes_when_voice_list_is_offline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "dialogue.md"
+    output_path = tmp_path / "dialogue.mp3"
+    config_path = tmp_path / "speakers.toml"
+    input_path.write_text("**Host:** Hello", encoding="utf-8")
+    config_path.write_text('[speakers.Host]\nvoice = "zh-CN-Male-A"\n', encoding="utf-8")
+    args = SimpleNamespace(
+        multi_speaker=True,
+        input=input_path,
+        output=output_path,
+        no_strip=False,
+        speaker_config=config_path,
+        speed=1.0,
+        srt=False,
+        video=False,
+    )
+    selected_maps: list[dict[str, str]] = []
+
+    def offline_voice_list() -> list[dict]:
+        raise OSError("offline")
+
+    def fake_synthesize_dialogue(
+        turns: list[md2audio.DialogueTurn], voice_map: dict[str, str], speed: float, output: Path,
+    ) -> list[dict]:
+        assert turns == [md2audio.DialogueTurn("Host", "Hello")]
+        assert speed == 1.0
+        selected_maps.append(voice_map)
+        output.write_bytes(b"audio")
+        return []
+
+    monkeypatch.setattr(md2audio, "fetch_voices", offline_voice_list)
+    monkeypatch.setattr(md2audio, "synthesize_dialogue", fake_synthesize_dialogue)
+
+    with pytest.warns(UserWarning, match="Could not fetch the Edge voice list"):
+        md2audio._cmd_synth(args)
+
+    assert selected_maps == [{"Host": "zh-CN-Male-A"}]
+    assert output_path.read_bytes() == b"audio"
+
+
+def test_multi_speaker_synth_removes_stale_srt_without_new_boundaries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "dialogue.mp3"
+    stale_srt = output_path.with_suffix(".srt")
+    stale_srt.write_text("stale subtitles", encoding="utf-8")
+    args = SimpleNamespace(multi_speaker=True, speed=1.0, srt=True, video=True)
+    subtitle_inputs: list[Path | None] = []
+
+    monkeypatch.setattr(
+        md2audio,
+        "_prepare_multi_speaker",
+        lambda _: (
+            output_path,
+            [md2audio.DialogueTurn("Host", "Hello")],
+            {"Host": "voice-a"},
+        ),
+    )
+
+    def fake_synthesize_dialogue(*_args: object) -> list[dict]:
+        output_path.write_bytes(b"new audio")
+        return []
+
+    def fake_generate_video(_audio: Path, _video: Path, subtitles: Path | None) -> None:
+        subtitle_inputs.append(subtitles)
+
+    monkeypatch.setattr(md2audio, "synthesize_dialogue", fake_synthesize_dialogue)
+    monkeypatch.setattr(md2audio, "generate_video", fake_generate_video)
+
+    md2audio._cmd_synth(args)
+
+    assert not stale_srt.exists()
+    assert subtitle_inputs == [None]
+
+
+def test_multi_speaker_rejects_explicit_voice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    input_path = tmp_path / "dialogue.md"
+    input_path.write_text("**Host:** Hello", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "md2audio",
+            "synth",
+            str(input_path),
+            "--multi-speaker",
+            "--speaker-config",
+            str(tmp_path / "speakers.toml"),
+            "--voice",
+            "zh-CN-YunyangNeural",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        md2audio.main()
+
+    assert exc_info.value.code == 2
+    assert "--voice and --multi-speaker are mutually exclusive" in capsys.readouterr().err
