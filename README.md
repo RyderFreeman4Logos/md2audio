@@ -76,6 +76,21 @@ Quoted TOML keys support Unicode names and spaces. Every detected speaker must
 be present; unused config entries cause a warning. The current Edge voice list
 is checked once for unavailable or deprecated configured voices.
 
+### Resume cache
+
+Multi-speaker synthesis caches each successful turn's MP3, boundaries, and
+identity metadata under `$XDG_CACHE_HOME/md2audio/dialogue/turns/` (or
+`~/.cache/md2audio/dialogue/turns/` when `XDG_CACHE_HOME` is unset). Cache keys
+include the processed turn text, speaker, voice, and speed, so a rerun only
+requests missing or changed turns. Transient Edge and network failures retry a
+bounded number of times; after a final failure the completed turn cache remains
+while the requested MP3 is left unchanged.
+
+Use `--no-cache` with `--multi-speaker` to force every turn to be synthesized
+without reading or writing the cache. For long transcripts such as a 538-turn
+Leopold dialogue, keep the default cache enabled: rerun the same command after
+an interruption to resume from completed turns instead of starting over.
+
 Multi-speaker MP3 output is an atomic binary concatenation of the MP3 frames
 returned by Edge TTS. This assumes Edge returns the same MP3 encoding for each
 request, and adds no `ffmpeg` dependency for audio-only output. Subtitle

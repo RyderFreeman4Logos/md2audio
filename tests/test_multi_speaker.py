@@ -140,6 +140,7 @@ def test_dialogue_synthesis_concatenates_audio_in_turn_order_and_offsets_srt(
         {"Host": "voice-a", "Guest": "voice-b"},
         1.0,
         output,
+        cache_dir=tmp_path / "cache",
     )
 
     assert output.read_bytes() == b"firstsecond"
@@ -157,11 +158,12 @@ def test_dialogue_synthesis_keeps_existing_output_when_a_turn_fails(
     def fake_segment(*_args: object) -> tuple[bytes, list[dict]]:
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls >= 2:
             raise OSError("network failed")
         return b"partial", [{"offset": 0, "duration": 1, "text": "text"}]
 
     monkeypatch.setattr(md2audio, "synthesize_dialogue_segment", fake_segment)
+    monkeypatch.setattr(md2audio.time, "sleep", lambda _: None)
 
     with pytest.raises(RuntimeError, match=r"turn 2.*Guest.*voice-b"):
         md2audio.synthesize_dialogue(
@@ -169,9 +171,141 @@ def test_dialogue_synthesis_keeps_existing_output_when_a_turn_fails(
             {"Host": "voice-a", "Guest": "voice-b"},
             1.0,
             output,
+            cache_dir=tmp_path / "cache",
         )
     assert output.read_bytes() == b"previous-output"
     assert not list(tmp_path.glob(".dialogue.*.partial"))
+    assert len(list((tmp_path / "cache").glob("*.mp3"))) == 1
+    assert len(list((tmp_path / "cache").glob("*.json"))) == 1
+
+
+def test_dialogue_cache_reuses_completed_turns_after_a_failed_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    output = tmp_path / "dialogue.mp3"
+    output.write_bytes(b"previous-output")
+    xdg_cache_home = tmp_path / "xdg-cache"
+    cache_dir = xdg_cache_home / "md2audio" / "dialogue" / "turns"
+    calls: list[str] = []
+    fail_second_turn = True
+
+    def fake_segment(text: str, *_args: object) -> tuple[bytes, list[dict]]:
+        calls.append(text)
+        if text == "two" and fail_second_turn:
+            raise OSError("temporary network failure")
+        return text.encode(), [{"offset": 0, "duration": 1, "text": text}]
+
+    turns = [
+        md2audio.DialogueTurn("Host", "one"),
+        md2audio.DialogueTurn("Guest", "two"),
+        md2audio.DialogueTurn("Host", "three"),
+    ]
+    voices = {"Host": "voice-a", "Guest": "voice-b"}
+    monkeypatch.setattr(md2audio, "synthesize_dialogue_segment", fake_segment)
+    monkeypatch.setattr(md2audio.time, "sleep", lambda _: None)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache_home))
+
+    with pytest.raises(RuntimeError, match=r"turn 2.*Guest.*voice-b"):
+        md2audio.synthesize_dialogue(turns, voices, 1.0, output)
+
+    assert output.read_bytes() == b"previous-output"
+    assert calls == ["one", "two", "two", "two", "two", "two"]
+    assert len(list(cache_dir.glob("*.mp3"))) == 1
+
+    calls.clear()
+    fail_second_turn = False
+    md2audio.synthesize_dialogue(turns, voices, 1.0, output)
+
+    assert calls == ["two", "three"]
+    assert output.read_bytes() == b"onetwothree"
+
+
+def test_dialogue_cache_identity_invalidates_only_changed_turns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    output = tmp_path / "dialogue.mp3"
+    cache_dir = tmp_path / "cache"
+    calls: list[tuple[str, str]] = []
+
+    def fake_segment(text: str, voice: str, _speed: float) -> tuple[bytes, list[dict]]:
+        calls.append((text, voice))
+        return f"{voice}:{text}".encode(), [{"offset": 0, "duration": 1, "text": text}]
+
+    monkeypatch.setattr(md2audio, "synthesize_dialogue_segment", fake_segment)
+    original_turns = [
+        md2audio.DialogueTurn("Host", "one"),
+        md2audio.DialogueTurn("Guest", "two"),
+    ]
+    voices = {"Host": "voice-a", "Guest": "voice-b"}
+    md2audio.synthesize_dialogue(original_turns, voices, 1.0, output, cache_dir=cache_dir)
+
+    calls.clear()
+    changed_text_turns = [
+        md2audio.DialogueTurn("Host", "one updated"),
+        md2audio.DialogueTurn("Guest", "two"),
+    ]
+    md2audio.synthesize_dialogue(changed_text_turns, voices, 1.0, output, cache_dir=cache_dir)
+    assert calls == [("one updated", "voice-a")]
+
+    calls.clear()
+    changed_voice_map = {"Host": "voice-a", "Guest": "voice-c"}
+    md2audio.synthesize_dialogue(
+        changed_text_turns, changed_voice_map, 1.0, output, cache_dir=cache_dir,
+    )
+    assert calls == [("two", "voice-c")]
+
+
+def test_dialogue_no_cache_always_synthesizes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    output = tmp_path / "dialogue.mp3"
+    cache_dir = tmp_path / "cache"
+    calls: list[str] = []
+
+    def fake_segment(text: str, *_args: object) -> tuple[bytes, list[dict]]:
+        calls.append(text)
+        return text.encode(), [{"offset": 0, "duration": 1, "text": text}]
+
+    monkeypatch.setattr(md2audio, "synthesize_dialogue_segment", fake_segment)
+    turns = [md2audio.DialogueTurn("Host", "one"), md2audio.DialogueTurn("Guest", "two")]
+    voices = {"Host": "voice-a", "Guest": "voice-b"}
+
+    md2audio.synthesize_dialogue(turns, voices, 1.0, output, cache_dir=cache_dir, use_cache=False)
+    md2audio.synthesize_dialogue(turns, voices, 1.0, output, cache_dir=cache_dir, use_cache=False)
+
+    assert calls == ["one", "two", "one", "two"]
+    assert not cache_dir.exists()
+
+
+def test_dialogue_retries_rate_limits_before_writing_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    output = tmp_path / "dialogue.mp3"
+    calls = 0
+
+    class RateLimited(Exception):
+        status_code = 429
+
+    def fake_segment(*_args: object) -> tuple[bytes, list[dict]]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RateLimited("too many requests")
+        return b"recovered", [{"offset": 0, "duration": 1, "text": "recovered"}]
+
+    monkeypatch.setattr(md2audio, "synthesize_dialogue_segment", fake_segment)
+    monkeypatch.setattr(md2audio.time, "sleep", lambda _: None)
+
+    md2audio.synthesize_dialogue(
+        [md2audio.DialogueTurn("Host", "one")],
+        {"Host": "voice-a"},
+        1.0,
+        output,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert calls == 2
+    assert output.read_bytes() == b"recovered"
 
 
 def test_single_speaker_cli_still_uses_existing_synthesis_path(
@@ -215,6 +349,7 @@ def test_config_mode_synthesizes_when_voice_list_is_offline(
         speed=1.0,
         srt=False,
         video=False,
+        no_cache=False,
     )
     selected_maps: list[dict[str, str]] = []
 
@@ -223,10 +358,12 @@ def test_config_mode_synthesizes_when_voice_list_is_offline(
 
     def fake_synthesize_dialogue(
         turns: list[md2audio.DialogueTurn], voice_map: dict[str, str], speed: float, output: Path,
+        *, use_cache: bool,
     ) -> list[dict]:
         assert turns == [md2audio.DialogueTurn("Host", "Hello")]
         assert speed == 1.0
         selected_maps.append(voice_map)
+        assert use_cache is True
         output.write_bytes(b"audio")
         return []
 
@@ -246,7 +383,9 @@ def test_multi_speaker_synth_removes_stale_srt_without_new_boundaries(
     output_path = tmp_path / "dialogue.mp3"
     stale_srt = output_path.with_suffix(".srt")
     stale_srt.write_text("stale subtitles", encoding="utf-8")
-    args = SimpleNamespace(multi_speaker=True, speed=1.0, srt=True, video=True)
+    args = SimpleNamespace(
+        multi_speaker=True, speed=1.0, srt=True, video=True, no_cache=False,
+    )
     subtitle_inputs: list[Path | None] = []
 
     monkeypatch.setattr(
@@ -259,7 +398,7 @@ def test_multi_speaker_synth_removes_stale_srt_without_new_boundaries(
         ),
     )
 
-    def fake_synthesize_dialogue(*_args: object) -> list[dict]:
+    def fake_synthesize_dialogue(*_args: object, **_kwargs: object) -> list[dict]:
         output_path.write_bytes(b"new audio")
         return []
 

@@ -1,6 +1,8 @@
 """Convert markdown files to audio (and optionally subtitles/video) via edge-tts."""
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -27,6 +29,9 @@ _SRT_MAX_CHARS = 35
 _SRT_MIN_CHARS = 10
 _SRT_SPLIT_TARGET = 20
 _TICKS_PER_SECOND = 10_000_000
+_DIALOGUE_CACHE_SCHEMA_VERSION = 1
+_DIALOGUE_RETRY_ATTEMPTS = 5
+_DIALOGUE_MAX_RETRY_DELAY_SECONDS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -302,16 +307,140 @@ def _dialogue_segment_duration(boundaries: list[dict], audio: bytes) -> int:
     return 0
 
 
+def _dialogue_cache_dir() -> Path:
+    """Return the XDG cache directory shared by resumable dialogue turns."""
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    cache_home = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+    return cache_home / "md2audio" / "dialogue" / "turns"
+
+
+def _dialogue_turn_identity(turn: DialogueTurn, voice: str, speed: float) -> dict[str, object]:
+    """Build the stable metadata used to validate one cached dialogue turn."""
+    return {
+        "speaker": turn.speaker,
+        "voice": voice,
+        "speed": float(speed),
+        "text_sha256": hashlib.sha256(turn.text.encode("utf-8")).hexdigest(),
+    }
+
+
+def _dialogue_turn_cache_paths(cache_dir: Path, identity: dict[str, object]) -> tuple[Path, Path]:
+    """Return the audio and metadata paths for one content-addressed turn."""
+    canonical_identity = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    cache_key = hashlib.sha256(canonical_identity.encode("utf-8")).hexdigest()
+    return cache_dir / f"{cache_key}.mp3", cache_dir / f"{cache_key}.json"
+
+
+def _load_cached_dialogue_turn(
+    cache_dir: Path, identity: dict[str, object],
+) -> tuple[bytes, list[dict]] | None:
+    """Load one valid cached turn, ignoring incomplete or corrupt cache entries."""
+    audio_path, metadata_path = _dialogue_turn_cache_paths(cache_dir, identity)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        audio = audio_path.read_bytes()
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    boundaries = metadata.get("boundaries")
+    if (
+        metadata.get("schema_version") != _DIALOGUE_CACHE_SCHEMA_VERSION
+        or metadata.get("identity") != identity
+        or metadata.get("audio_sha256") != hashlib.sha256(audio).hexdigest()
+        or not isinstance(boundaries, list)
+        or not all(isinstance(boundary, dict) for boundary in boundaries)
+    ):
+        return None
+    return audio, boundaries
+
+
+def _write_cached_dialogue_turn(
+    cache_dir: Path, identity: dict[str, object], audio: bytes, boundaries: list[dict],
+) -> None:
+    """Atomically store one successful dialogue turn and its timing metadata."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    audio_path, metadata_path = _dialogue_turn_cache_paths(cache_dir, identity)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{audio_path.stem}.", suffix=".mp3.partial", dir=cache_dir,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as audio_file:
+            audio_file.write(audio)
+        temporary.replace(audio_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+    metadata = {
+        "schema_version": _DIALOGUE_CACHE_SCHEMA_VERSION,
+        "identity": identity,
+        "audio_sha256": hashlib.sha256(audio).hexdigest(),
+        "boundaries": boundaries,
+    }
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{metadata_path.stem}.", suffix=".json.partial", dir=cache_dir,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as metadata_file:
+            json.dump(metadata, metadata_file, ensure_ascii=False, sort_keys=True)
+        temporary.replace(metadata_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _is_retryable_dialogue_error(error: Exception) -> bool:
+    """Return whether an Edge/network failure is safe to retry on this turn."""
+    if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+        return True
+    status = getattr(error, "status", None)
+    if status is None:
+        status = getattr(error, "status_code", None)
+    if isinstance(status, int) and (status == 429 or 500 <= status < 600):
+        return True
+    return bool(re.search(r"\b(?:429|5\d\d)\b", str(error)))
+
+
+def _synthesize_dialogue_turn_with_retries(
+    text: str, voice: str, speed: float,
+) -> tuple[bytes, list[dict]]:
+    """Synthesize one turn with bounded exponential backoff for transient errors."""
+    for attempt in range(1, _DIALOGUE_RETRY_ATTEMPTS + 1):
+        try:
+            return synthesize_dialogue_segment(text, voice, speed)
+        except Exception as exc:
+            if not _is_retryable_dialogue_error(exc) or attempt == _DIALOGUE_RETRY_ATTEMPTS:
+                raise
+            delay = min(2 ** (attempt - 1), _DIALOGUE_MAX_RETRY_DELAY_SECONDS)
+            print(
+                f"    transient failure ({exc}); retrying in {delay}s "
+                f"({attempt}/{_DIALOGUE_RETRY_ATTEMPTS})"
+            )
+            time.sleep(delay)
+    raise AssertionError("dialogue retry loop exhausted without returning or raising")
+
+
 def synthesize_dialogue(
-    turns: list[DialogueTurn], voice_map: dict[str, str], speed: float, output: Path,
+    turns: list[DialogueTurn],
+    voice_map: dict[str, str],
+    speed: float,
+    output: Path,
+    *,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
 ) -> list[dict]:
-    """Atomically synthesize, concatenate, and offset a multi-speaker dialogue.
+    """Atomically synthesize, concatenate, and offset a resumable dialogue.
 
     Edge TTS returns identically encoded MP3 frames for each request, so the
     completed output is a sequential binary concatenation. The original output
-    is retained unless every turn succeeds.
+    is retained unless every turn succeeds. Successful turns are cached by
+    their text, speaker, voice, and speed unless ``use_cache`` is false.
     """
     output.parent.mkdir(parents=True, exist_ok=True)
+    turn_cache_dir = cache_dir or _dialogue_cache_dir() if use_cache else None
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{output.stem}.", suffix=f"{output.suffix}.partial", dir=output.parent,
     )
@@ -322,14 +451,27 @@ def synthesize_dialogue(
         with os.fdopen(descriptor, "wb") as combined_audio:
             for index, turn in enumerate(turns, 1):
                 voice = voice_map[turn.speaker]
-                print(f"  Turn {index}/{len(turns)}: {turn.speaker} ({voice})")
-                try:
-                    audio, boundaries = synthesize_dialogue_segment(turn.text, voice, speed)
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Synthesis failed at turn {index} for speaker {turn.speaker!r} "
-                        f"with voice {voice!r}: {exc}"
-                    ) from exc
+                identity = _dialogue_turn_identity(turn, voice, speed)
+                cached_turn = (
+                    _load_cached_dialogue_turn(turn_cache_dir, identity)
+                    if turn_cache_dir is not None else None
+                )
+                if cached_turn is not None:
+                    audio, boundaries = cached_turn
+                    print(f"  Turn {index}/{len(turns)}: {turn.speaker} ({voice}) [cache hit]")
+                else:
+                    print(f"  Turn {index}/{len(turns)}: {turn.speaker} ({voice}) [synthesizing]")
+                    try:
+                        audio, boundaries = _synthesize_dialogue_turn_with_retries(
+                            turn.text, voice, speed,
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Synthesis failed at turn {index} for speaker {turn.speaker!r} "
+                            f"with voice {voice!r}: {exc}"
+                        ) from exc
+                    if turn_cache_dir is not None:
+                        _write_cached_dialogue_turn(turn_cache_dir, identity, audio, boundaries)
                 combined_audio.write(audio)
                 for boundary in boundaries:
                     shifted = dict(boundary)
@@ -446,6 +588,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="Automatic mode: deterministic speaker-to-voice assignment seed")
     g.add_argument("--speaker-config", type=Path,
                    help="TOML file mapping each speaker label to an Edge voice")
+    g.add_argument("--no-cache", action="store_true",
+                   help="Multi-speaker mode: synthesize every turn without reading or writing cache")
 
 
 def _resolve(args) -> tuple[Path, str]:
@@ -539,10 +683,11 @@ def _validate_multi_speaker_args(args, parser: argparse.ArgumentParser) -> None:
         args.speaker_language,
         args.speaker_config,
         args.seed is not None,
+        args.no_cache,
     ))
     if not args.multi_speaker:
         if has_dialogue_selector:
-            parser.error("--speaker-* options and --seed require --multi-speaker")
+            parser.error("--speaker-* options, --seed, and --no-cache require --multi-speaker")
         return
     if args.voice is not None:
         parser.error("--voice and --multi-speaker are mutually exclusive")
@@ -573,7 +718,9 @@ def _cmd_synth(args) -> None:
         print(f"Output: {out}")
         print("Synthesizing dialogue..." + (" (with subtitles)" if srt_out else ""))
         try:
-            bounds = synthesize_dialogue(turns, voice_map, args.speed, out)
+            bounds = synthesize_dialogue(
+                turns, voice_map, args.speed, out, use_cache=not args.no_cache,
+            )
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -637,7 +784,9 @@ def _cmd_bundle(args) -> None:
 
         print("\n[1/3] Synthesizing dialogue...")
         try:
-            bounds = synthesize_dialogue(turns, voice_map, args.speed, out)
+            bounds = synthesize_dialogue(
+                turns, voice_map, args.speed, out, use_cache=not args.no_cache,
+            )
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
