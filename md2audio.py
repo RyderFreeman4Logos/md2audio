@@ -425,7 +425,11 @@ def _is_retryable_dialogue_error(error: Exception) -> bool:
     """Return whether an Edge/network failure is safe to retry on this turn."""
     if isinstance(error, PermissionError):
         return False
-    if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+    if isinstance(error, TimeoutError):
+        return True
+    if isinstance(error, getattr(asyncio, "TimeoutError", ())):
+        return True
+    if isinstance(error, (ConnectionError, OSError)):
         return True
     error_type = type(error)
     if (
@@ -478,9 +482,15 @@ def _prepare_dialogue_cache_dir(cache_dir: Path) -> Path | None:
         temporary.unlink()
     except OSError as exc:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
         warnings.warn(
             f"Dialogue cache is unavailable at {cache_dir}: {exc}; continuing without cache. "
             "Use --no-cache to silence this warning.",

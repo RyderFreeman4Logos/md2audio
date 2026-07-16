@@ -365,6 +365,7 @@ def test_dialogue_retry_classifies_aiohttp_and_edge_transient_errors() -> None:
     assert md2audio._is_retryable_dialogue_error(ClientPayloadError("connection reset"))
     assert md2audio._is_retryable_dialogue_error(WebSocketError("connection reset"))
     assert md2audio._is_retryable_dialogue_error(TimeoutError("timed out"))
+    assert md2audio._is_retryable_dialogue_error(asyncio.TimeoutError("timed out"))
     assert not md2audio._is_retryable_dialogue_error(PermissionError("read-only"))
 
 
@@ -417,6 +418,38 @@ def test_dialogue_cache_preflight_failure_keeps_successful_audio(
     assert output.read_bytes() == b"audio"
     assert cache_dir.exists()
     assert not list(cache_dir.iterdir())
+
+
+def test_dialogue_cache_preflight_ignores_secondary_unlink_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "dialogue.mp3"
+    original_unlink = Path.unlink
+    unlink_calls = 0
+
+    def fail_preflight_unlinks(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal unlink_calls
+        if path.parent == cache_dir and path.name.startswith(".md2audio-write-check."):
+            unlink_calls += 1
+            raise OSError(f"unlink failure {unlink_calls}")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_preflight_unlinks)
+    monkeypatch.setattr(
+        md2audio,
+        "synthesize_dialogue_segment",
+        lambda *_: (b"audio", [{"offset": 0, "duration": 1, "text": "text"}]),
+    )
+
+    with pytest.warns(UserWarning, match="continuing without cache"):
+        md2audio.synthesize_dialogue(
+            [md2audio.DialogueTurn("Host", "text")], {"Host": "voice"}, 1.0, output,
+            cache_dir=cache_dir,
+        )
+
+    assert output.read_bytes() == b"audio"
+    assert unlink_calls == 2
 
 
 def test_dialogue_cache_write_failure_keeps_successful_audio(
