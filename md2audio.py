@@ -1,6 +1,7 @@
 """Convert markdown files to audio (and optionally subtitles/video) via edge-tts."""
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -29,9 +30,17 @@ _SRT_MAX_CHARS = 35
 _SRT_MIN_CHARS = 10
 _SRT_SPLIT_TARGET = 20
 _TICKS_PER_SECOND = 10_000_000
-_DIALOGUE_CACHE_SCHEMA_VERSION = 1
+_DIALOGUE_CACHE_SCHEMA_VERSION = 2
 _DIALOGUE_RETRY_ATTEMPTS = 5
 _DIALOGUE_MAX_RETRY_DELAY_SECONDS = 8
+_DIALOGUE_TURN_TIMEOUT_SECONDS = 60
+_AIOHTTP_RETRYABLE_ERROR_NAMES = frozenset({
+    "ClientConnectionError",
+    "ClientOSError",
+    "ClientPayloadError",
+    "ServerDisconnectedError",
+    "ServerTimeoutError",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +233,11 @@ def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
     return bounds
 
 
-def synthesize_dialogue_segment(text: str, voice: str, speed: float) -> tuple[bytes, list[dict]]:
-    """Synthesize one dialogue turn into MP3 bytes and its local boundaries."""
-    rate = f"{int((speed - 1) * 100):+d}%"
-    communication = edge_tts.Communicate(text, voice, rate=rate)
+async def _collect_dialogue_stream(communication: edge_tts.Communicate) -> tuple[bytes, list[dict]]:
+    """Collect one Edge stream while allowing its async exceptions to propagate."""
     audio_parts: list[bytes] = []
     boundaries: list[dict] = []
-    for chunk in communication.stream_sync():
+    async for chunk in communication.stream():
         if chunk["type"] == "audio":
             audio_parts.append(chunk["data"])
         elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
@@ -240,6 +247,15 @@ def synthesize_dialogue_segment(text: str, voice: str, speed: float) -> tuple[by
                 "text": chunk.get("text", ""),
             })
     return b"".join(audio_parts), boundaries
+
+
+def synthesize_dialogue_segment(text: str, voice: str, speed: float) -> tuple[bytes, list[dict]]:
+    """Synthesize one dialogue turn with exception propagation and a hard timeout."""
+    rate = f"{int((speed - 1) * 100):+d}%"
+    communication = edge_tts.Communicate(text, voice, rate=rate)
+    return asyncio.run(asyncio.wait_for(
+        _collect_dialogue_stream(communication), timeout=_DIALOGUE_TURN_TIMEOUT_SECONDS,
+    ))
 
 
 def _mp3_duration_ticks(audio: bytes) -> int:
@@ -324,33 +340,44 @@ def _dialogue_turn_identity(turn: DialogueTurn, voice: str, speed: float) -> dic
     }
 
 
-def _dialogue_turn_cache_paths(cache_dir: Path, identity: dict[str, object]) -> tuple[Path, Path]:
-    """Return the audio and metadata paths for one content-addressed turn."""
+def _dialogue_turn_manifest_path(cache_dir: Path, identity: dict[str, object]) -> Path:
+    """Return the atomically published cache manifest path for one turn identity."""
     canonical_identity = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     cache_key = hashlib.sha256(canonical_identity.encode("utf-8")).hexdigest()
-    return cache_dir / f"{cache_key}.mp3", cache_dir / f"{cache_key}.json"
+    return cache_dir / f"{cache_key}.json"
+
+
+def _dialogue_audio_cache_path(cache_dir: Path, audio_sha256: str) -> Path:
+    """Return the immutable content-addressed audio path named by its checksum."""
+    return cache_dir / f"{audio_sha256}.mp3"
 
 
 def _load_cached_dialogue_turn(
     cache_dir: Path, identity: dict[str, object],
 ) -> tuple[bytes, list[dict]] | None:
     """Load one valid cached turn, ignoring incomplete or corrupt cache entries."""
-    audio_path, metadata_path = _dialogue_turn_cache_paths(cache_dir, identity)
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        audio = audio_path.read_bytes()
+        metadata = json.loads(_dialogue_turn_manifest_path(cache_dir, identity).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(metadata, dict):
         return None
     boundaries = metadata.get("boundaries")
+    audio_sha256 = metadata.get("audio_sha256")
     if (
         metadata.get("schema_version") != _DIALOGUE_CACHE_SCHEMA_VERSION
         or metadata.get("identity") != identity
-        or metadata.get("audio_sha256") != hashlib.sha256(audio).hexdigest()
+        or not isinstance(audio_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", audio_sha256) is None
         or not isinstance(boundaries, list)
         or not all(isinstance(boundary, dict) for boundary in boundaries)
     ):
+        return None
+    try:
+        audio = _dialogue_audio_cache_path(cache_dir, audio_sha256).read_bytes()
+    except OSError:
+        return None
+    if hashlib.sha256(audio).hexdigest() != audio_sha256:
         return None
     return audio, boundaries
 
@@ -358,9 +385,10 @@ def _load_cached_dialogue_turn(
 def _write_cached_dialogue_turn(
     cache_dir: Path, identity: dict[str, object], audio: bytes, boundaries: list[dict],
 ) -> None:
-    """Atomically store one successful dialogue turn and its timing metadata."""
+    """Store immutable audio, then atomically publish the matching turn manifest."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    audio_path, metadata_path = _dialogue_turn_cache_paths(cache_dir, identity)
+    audio_sha256 = hashlib.sha256(audio).hexdigest()
+    audio_path = _dialogue_audio_cache_path(cache_dir, audio_sha256)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{audio_path.stem}.", suffix=".mp3.partial", dir=cache_dir,
     )
@@ -376,9 +404,10 @@ def _write_cached_dialogue_turn(
     metadata = {
         "schema_version": _DIALOGUE_CACHE_SCHEMA_VERSION,
         "identity": identity,
-        "audio_sha256": hashlib.sha256(audio).hexdigest(),
+        "audio_sha256": audio_sha256,
         "boundaries": boundaries,
     }
+    metadata_path = _dialogue_turn_manifest_path(cache_dir, identity)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{metadata_path.stem}.", suffix=".json.partial", dir=cache_dir,
     )
@@ -394,7 +423,20 @@ def _write_cached_dialogue_turn(
 
 def _is_retryable_dialogue_error(error: Exception) -> bool:
     """Return whether an Edge/network failure is safe to retry on this turn."""
+    if isinstance(error, PermissionError):
+        return False
     if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+        return True
+    error_type = type(error)
+    if (
+        error_type.__module__.startswith("aiohttp.")
+        and error_type.__name__ in _AIOHTTP_RETRYABLE_ERROR_NAMES
+    ):
+        return True
+    if (
+        error_type.__module__ == "edge_tts.exceptions"
+        and error_type.__name__ == "WebSocketError"
+    ):
         return True
     status = getattr(error, "status", None)
     if status is None:
@@ -423,6 +465,32 @@ def _synthesize_dialogue_turn_with_retries(
     raise AssertionError("dialogue retry loop exhausted without returning or raising")
 
 
+def _prepare_dialogue_cache_dir(cache_dir: Path) -> Path | None:
+    """Return a writable cache directory, or disable caching before any network work."""
+    descriptor: int | None = None
+    temporary: Path | None = None
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".md2audio-write-check.", dir=cache_dir)
+        temporary = Path(temporary_name)
+        os.close(descriptor)
+        descriptor = None
+        temporary.unlink()
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        warnings.warn(
+            f"Dialogue cache is unavailable at {cache_dir}: {exc}; continuing without cache. "
+            "Use --no-cache to silence this warning.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    return cache_dir
+
+
 def synthesize_dialogue(
     turns: list[DialogueTurn],
     voice_map: dict[str, str],
@@ -441,6 +509,8 @@ def synthesize_dialogue(
     """
     output.parent.mkdir(parents=True, exist_ok=True)
     turn_cache_dir = cache_dir or _dialogue_cache_dir() if use_cache else None
+    if turn_cache_dir is not None:
+        turn_cache_dir = _prepare_dialogue_cache_dir(turn_cache_dir)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{output.stem}.", suffix=f"{output.suffix}.partial", dir=output.parent,
     )
@@ -471,7 +541,16 @@ def synthesize_dialogue(
                             f"with voice {voice!r}: {exc}"
                         ) from exc
                     if turn_cache_dir is not None:
-                        _write_cached_dialogue_turn(turn_cache_dir, identity, audio, boundaries)
+                        try:
+                            _write_cached_dialogue_turn(turn_cache_dir, identity, audio, boundaries)
+                        except OSError as exc:
+                            warnings.warn(
+                                f"Could not write dialogue cache at {turn_cache_dir}: {exc}; "
+                                "continuing without cache. Use --no-cache to silence this warning.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
+                            turn_cache_dir = None
                 combined_audio.write(audio)
                 for boundary in boundaries:
                     shifted = dict(boundary)

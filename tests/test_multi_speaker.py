@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -306,6 +308,143 @@ def test_dialogue_retries_rate_limits_before_writing_cache(
 
     assert calls == 2
     assert output.read_bytes() == b"recovered"
+
+
+def test_dialogue_async_stream_errors_reach_the_retry_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+
+    class FakeCommunicate:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def stream(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                yield {"type": "audio", "data": b"discarded"}
+                raise OSError("503 upstream unavailable")
+            yield {"type": "audio", "data": b"recovered"}
+            yield {"type": "WordBoundary", "offset": 0, "duration": 1, "text": "ok"}
+
+    monkeypatch.setattr(md2audio.edge_tts, "Communicate", FakeCommunicate)
+    monkeypatch.setattr(md2audio.time, "sleep", lambda _: None)
+
+    assert md2audio._synthesize_dialogue_turn_with_retries("text", "voice", 1.0) == (
+        b"recovered", [{"offset": 0, "duration": 1, "text": "ok"}],
+    )
+    assert attempts == 2
+
+
+def test_dialogue_async_stream_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    class HangingCommunicate:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def stream(self):
+            await asyncio.Event().wait()
+            yield {"type": "audio", "data": b"unreachable"}
+
+    monkeypatch.setattr(md2audio.edge_tts, "Communicate", HangingCommunicate)
+    monkeypatch.setattr(md2audio, "_DIALOGUE_TURN_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        md2audio.synthesize_dialogue_segment("text", "voice", 1.0)
+
+
+def test_dialogue_retry_classifies_aiohttp_and_edge_transient_errors() -> None:
+    class ClientPayloadError(Exception):
+        pass
+
+    ClientPayloadError.__module__ = "aiohttp.client_exceptions"
+
+    class WebSocketError(Exception):
+        pass
+
+    WebSocketError.__module__ = "edge_tts.exceptions"
+
+    assert md2audio._is_retryable_dialogue_error(ClientPayloadError("connection reset"))
+    assert md2audio._is_retryable_dialogue_error(WebSocketError("connection reset"))
+    assert md2audio._is_retryable_dialogue_error(TimeoutError("timed out"))
+    assert not md2audio._is_retryable_dialogue_error(PermissionError("read-only"))
+
+
+def test_dialogue_cache_manifest_never_pairs_audio_with_other_writer_metadata(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    identity = md2audio._dialogue_turn_identity(md2audio.DialogueTurn("Host", "text"), "voice", 1.0)
+    first = (b"first", [{"offset": 0, "duration": 1, "text": "first"}])
+    second = (b"second", [{"offset": 0, "duration": 1, "text": "second"}])
+    start = threading.Barrier(2)
+
+    def write_cached_turn(audio: bytes, boundaries: list[dict]) -> None:
+        start.wait()
+        md2audio._write_cached_dialogue_turn(cache_dir, identity, audio, boundaries)
+
+    first_writer = threading.Thread(target=write_cached_turn, args=first)
+    second_writer = threading.Thread(target=write_cached_turn, args=second)
+    first_writer.start()
+    second_writer.start()
+    first_writer.join()
+    second_writer.join()
+
+    assert md2audio._load_cached_dialogue_turn(cache_dir, identity) in (first, second)
+
+
+def test_dialogue_cache_preflight_failure_keeps_successful_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    output = tmp_path / "dialogue.mp3"
+    original_mkstemp = md2audio.tempfile.mkstemp
+
+    def fail_cache_preflight(*args: object, **kwargs: object) -> tuple[int, str]:
+        if kwargs.get("dir") == cache_dir:
+            raise OSError("cache unavailable")
+        return original_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(md2audio.tempfile, "mkstemp", fail_cache_preflight)
+    monkeypatch.setattr(
+        md2audio,
+        "synthesize_dialogue_segment",
+        lambda *_: (b"audio", [{"offset": 0, "duration": 1, "text": "text"}]),
+    )
+
+    with pytest.warns(UserWarning, match="continuing without cache"):
+        md2audio.synthesize_dialogue(
+            [md2audio.DialogueTurn("Host", "text")], {"Host": "voice"}, 1.0, output,
+            cache_dir=cache_dir,
+        )
+
+    assert output.read_bytes() == b"audio"
+    assert cache_dir.exists()
+    assert not list(cache_dir.iterdir())
+
+
+def test_dialogue_cache_write_failure_keeps_successful_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    output = tmp_path / "dialogue.mp3"
+    writes = 0
+
+    def fail_cache_write(*_args: object) -> None:
+        nonlocal writes
+        writes += 1
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        md2audio,
+        "synthesize_dialogue_segment",
+        lambda text, *_: (text.encode(), [{"offset": 0, "duration": 1, "text": text}]),
+    )
+    monkeypatch.setattr(md2audio, "_write_cached_dialogue_turn", fail_cache_write)
+
+    with pytest.warns(UserWarning, match="continuing without cache"):
+        md2audio.synthesize_dialogue(
+            [md2audio.DialogueTurn("Host", "one"), md2audio.DialogueTurn("Guest", "two")],
+            {"Host": "voice-a", "Guest": "voice-b"}, 1.0, output, cache_dir=tmp_path / "cache",
+        )
+
+    assert output.read_bytes() == b"onetwo"
+    assert writes == 1
 
 
 def test_single_speaker_cli_still_uses_existing_synthesis_path(
