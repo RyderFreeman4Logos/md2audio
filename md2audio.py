@@ -1,20 +1,32 @@
 """Convert markdown files to audio (and optionally subtitles/video) via edge-tts."""
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import warnings
 from pathlib import Path
 
 import edge_tts
+from md2audio_dialogue import (
+    DialogueTurn,
+    fetch_voices,
+    load_speaker_config,
+    parse_dialogue,
+    resolve_auto_voice_map,
+    resolve_config_voice_map,
+)
 
 DEFAULT_VOICE = "zh-CN-YunyangNeural"
 DEFAULT_SPEED = 1.0
 _SRT_MAX_CHARS = 35
 _SRT_MIN_CHARS = 10
 _SRT_SPLIT_TARGET = 20
+_TICKS_PER_SECOND = 10_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +199,134 @@ def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
     return bounds
 
 
+def synthesize_dialogue_segment(text: str, voice: str, speed: float) -> tuple[bytes, list[dict]]:
+    """Synthesize one dialogue turn into MP3 bytes and its local boundaries."""
+    rate = f"{int((speed - 1) * 100):+d}%"
+    communication = edge_tts.Communicate(text, voice, rate=rate)
+    audio_parts: list[bytes] = []
+    boundaries: list[dict] = []
+    for chunk in communication.stream_sync():
+        if chunk["type"] == "audio":
+            audio_parts.append(chunk["data"])
+        elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+            boundaries.append({
+                "offset": chunk["offset"],
+                "duration": chunk["duration"],
+                "text": chunk.get("text", ""),
+            })
+    return b"".join(audio_parts), boundaries
+
+
+def _mp3_duration_ticks(audio: bytes) -> int:
+    """Estimate MP3 duration from frame headers without requiring ffmpeg."""
+    if audio.startswith(b"ID3") and len(audio) >= 10:
+        tag_size = sum((byte & 0x7F) << (7 * (3 - index)) for index, byte in enumerate(audio[6:10]))
+        position = min(10 + tag_size, len(audio))
+    else:
+        position = 0
+
+    mpeg1_rates = (44_100, 48_000, 32_000)
+    mpeg2_rates = (22_050, 24_000, 16_000)
+    mpeg25_rates = (11_025, 12_000, 8_000)
+    mpeg1_layer3_bitrates = (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320)
+    mpeg2_layer3_bitrates = (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160)
+    seconds = 0.0
+    while position + 4 <= len(audio):
+        header = int.from_bytes(audio[position:position + 4], "big")
+        if header >> 21 != 0x7FF:
+            position += 1
+            continue
+        version = (header >> 19) & 0b11
+        layer = (header >> 17) & 0b11
+        bitrate_index = (header >> 12) & 0b1111
+        sample_rate_index = (header >> 10) & 0b11
+        padding = (header >> 9) & 0b1
+        if version == 1 or layer != 1 or bitrate_index in (0, 15) or sample_rate_index == 3:
+            position += 1
+            continue
+        if version == 3:
+            sample_rate = mpeg1_rates[sample_rate_index]
+            bitrate = mpeg1_layer3_bitrates[bitrate_index]
+            samples_per_frame = 1_152
+            frame_size = 144 * bitrate * 1_000 // sample_rate + padding
+        else:
+            sample_rate = (mpeg2_rates if version == 2 else mpeg25_rates)[sample_rate_index]
+            bitrate = mpeg2_layer3_bitrates[bitrate_index]
+            samples_per_frame = 576
+            frame_size = 72 * bitrate * 1_000 // sample_rate + padding
+        if frame_size < 4 or position + frame_size > len(audio):
+            position += 1
+            continue
+        seconds += samples_per_frame / sample_rate
+        position += frame_size
+    return round(seconds * _TICKS_PER_SECOND)
+
+
+def _dialogue_segment_duration(boundaries: list[dict], audio: bytes) -> int:
+    """Prefer boundary timing, falling back to MP3 frame duration when needed."""
+    boundary_duration = max(
+        (int(boundary["offset"]) + int(boundary["duration"]) for boundary in boundaries),
+        default=0,
+    )
+    if boundary_duration:
+        return boundary_duration
+    audio_duration = _mp3_duration_ticks(audio)
+    if audio_duration:
+        warnings.warn(
+            "Dialogue turn had no boundary events; using MP3 frame duration for subtitle offsets.",
+            UserWarning,
+            stacklevel=2,
+        )
+    else:
+        warnings.warn(
+            "Dialogue turn had no usable timing data; later subtitle offsets may be inaccurate.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return audio_duration
+
+
+def synthesize_dialogue(
+    turns: list[DialogueTurn], voice_map: dict[str, str], speed: float, output: Path,
+) -> list[dict]:
+    """Atomically synthesize, concatenate, and offset a multi-speaker dialogue.
+
+    Edge TTS returns identically encoded MP3 frames for each request, so the
+    completed output is a sequential binary concatenation. The original output
+    is retained unless every turn succeeds.
+    """
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.stem}.", suffix=f"{output.suffix}.partial", dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    cumulative_duration = 0
+    all_boundaries: list[dict] = []
+    try:
+        with os.fdopen(descriptor, "wb") as combined_audio:
+            for index, turn in enumerate(turns, 1):
+                voice = voice_map[turn.speaker]
+                print(f"  Turn {index}/{len(turns)}: {turn.speaker} ({voice})")
+                try:
+                    audio, boundaries = synthesize_dialogue_segment(turn.text, voice, speed)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Synthesis failed at turn {index} for speaker {turn.speaker!r} "
+                        f"with voice {voice!r}: {exc}"
+                    ) from exc
+                combined_audio.write(audio)
+                for boundary in boundaries:
+                    shifted = dict(boundary)
+                    shifted["offset"] = int(shifted["offset"]) + cumulative_duration
+                    all_boundaries.append(shifted)
+                cumulative_duration += _dialogue_segment_duration(boundaries, audio)
+        temporary.replace(output)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return all_boundaries
+
+
 # ---------------------------------------------------------------------------
 # Video generation
 # ---------------------------------------------------------------------------
@@ -276,6 +416,20 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("Processing")
     g.add_argument("--no-strip", action="store_true",
                    help="Don't strip markdown formatting")
+    g = p.add_argument_group("Multi-speaker dialogue")
+    g.add_argument("--multi-speaker", action="store_true",
+                   help="Parse line-start bold speaker labels and synthesize each turn")
+    g.add_argument("--speaker-gender", choices=("male", "female"),
+                   help="Automatic mode: required Edge voice gender")
+    selectors = g.add_mutually_exclusive_group()
+    selectors.add_argument("--speaker-locale",
+                           help="Automatic mode: exact Edge voice locale, for example zh-CN")
+    selectors.add_argument("--speaker-language",
+                           help="Automatic mode: voice language, for example zh")
+    g.add_argument("--seed", type=int,
+                   help="Automatic mode: deterministic speaker-to-voice assignment seed")
+    g.add_argument("--speaker-config", type=Path,
+                   help="TOML file mapping each speaker label to an Edge voice")
 
 
 def _resolve(args) -> tuple[Path, str]:
@@ -291,12 +445,121 @@ def _resolve(args) -> tuple[Path, str]:
     return out, text
 
 
+def _resolve_dialogue(args) -> tuple[Path, list[DialogueTurn]]:
+    """Read, parse, and optionally strip a multi-speaker input document."""
+    if not args.input.exists():
+        raise ValueError(f"Input file not found: {args.input}")
+    out = args.output or Path.home() / "w" / f"{args.input.stem}.mp3"
+    raw = args.input.read_text(encoding="utf-8")
+    parsed_turns = parse_dialogue(raw)
+    turns: list[DialogueTurn] = []
+    for turn in parsed_turns:
+        text = turn.text if args.no_strip else strip_markdown(turn.text)
+        if not text:
+            warnings.warn(
+                f"Ignoring empty dialogue turn for speaker {turn.speaker!r} after Markdown processing.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        turns.append(DialogueTurn(turn.speaker, text))
+    if not turns:
+        raise ValueError("Multi-speaker input contains no speakable dialogue turns.")
+    print(
+        f"Input:  {args.input} ({len(raw)} chars → "
+        f"{sum(len(turn.text) for turn in turns)} across {len(turns)} turns)"
+    )
+    return out, turns
+
+
+def _resolve_dialogue_voices(args, speakers: list[str]) -> dict[str, str]:
+    """Choose dialogue voices from either strict TOML config or Edge metadata."""
+    voices = fetch_voices()
+    if args.speaker_config:
+        return resolve_config_voice_map(speakers, load_speaker_config(args.speaker_config), voices)
+    return resolve_auto_voice_map(
+        speakers,
+        voices,
+        args.speaker_gender,
+        locale=args.speaker_locale,
+        language=args.speaker_language,
+        seed=args.seed,
+    )
+
+
+def _prepare_multi_speaker(args) -> tuple[Path, list[DialogueTurn], dict[str, str]]:
+    """Resolve all offline input and one-time voice selection before synthesis."""
+    out, turns = _resolve_dialogue(args)
+    voice_map = _resolve_dialogue_voices(
+        args, list(dict.fromkeys(turn.speaker for turn in turns))
+    )
+    print("Speaker voices:")
+    for speaker, voice in voice_map.items():
+        print(f"  {speaker}: {voice}")
+    return out, turns, voice_map
+
+
+def _validate_multi_speaker_args(args, parser: argparse.ArgumentParser) -> None:
+    """Reject dialogue selectors that are incomplete or would be ignored."""
+    has_dialogue_selector = any((
+        args.speaker_gender,
+        args.speaker_locale,
+        args.speaker_language,
+        args.speaker_config,
+        args.seed is not None,
+    ))
+    if not args.multi_speaker:
+        if has_dialogue_selector:
+            parser.error("--speaker-* options and --seed require --multi-speaker")
+        return
+    if args.speaker_config:
+        if any((args.speaker_gender, args.speaker_locale, args.speaker_language, args.seed is not None)):
+            parser.error("--speaker-config cannot be combined with automatic speaker selectors")
+        return
+    if not args.speaker_gender:
+        parser.error("automatic multi-speaker mode requires --speaker-gender")
+    if bool(args.speaker_locale) == bool(args.speaker_language):
+        parser.error("automatic multi-speaker mode needs exactly one of --speaker-locale or --speaker-language")
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 
 def _cmd_synth(args) -> None:
     """Synthesize audio, with optional SRT and video."""
+    if args.multi_speaker:
+        try:
+            out, turns, voice_map = _prepare_multi_speaker(args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        srt_out = out.with_suffix(".srt") if args.srt else None
+
+        print(f"Output: {out}")
+        print("Synthesizing dialogue..." + (" (with subtitles)" if srt_out else ""))
+        try:
+            bounds = synthesize_dialogue(turns, voice_map, args.speed, out)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Audio:  {out.stat().st_size / (1024 * 1024):.1f} MB")
+
+        if srt_out:
+            srt_content = build_quality_srt(bounds)
+            if srt_content:
+                srt_out.write_text(srt_content, encoding="utf-8")
+                print(f"SRT:    {srt_content.count(' --> ')} blocks → {srt_out}")
+
+        if args.video:
+            vp = out.with_suffix(".mp4")
+            generate_video(out, vp, srt_out if srt_out and srt_out.exists() else None)
+            if vp.exists():
+                print(f"Video:  {vp.stat().st_size / (1024 * 1024):.1f} MB → {vp}")
+
+        print("Done!")
+        return
+
     out, text = _resolve(args)
     srt_out = out.with_suffix(".srt") if args.srt else None
 
@@ -324,6 +587,44 @@ def _cmd_synth(args) -> None:
 
 def _cmd_bundle(args) -> None:
     """Generate audio + SRT subtitles + waveform video in one step."""
+    if args.multi_speaker:
+        try:
+            out, turns, voice_map = _prepare_multi_speaker(args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        srt_path = out.with_suffix(".srt")
+        vid_path = out.with_suffix(".mp4")
+
+        print(f"Audio:  {out}")
+        print(f"SRT:    {srt_path}")
+        print(f"Video:  {vid_path}")
+
+        print("\n[1/3] Synthesizing dialogue...")
+        try:
+            bounds = synthesize_dialogue(turns, voice_map, args.speed, out)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  {out.stat().st_size / (1024 * 1024):.1f} MB")
+
+        print("\n[2/3] Generating subtitles...")
+        srt_content = build_quality_srt(bounds)
+        if srt_content:
+            srt_path.write_text(srt_content, encoding="utf-8")
+            print(f"  {srt_content.count(' --> ')} subtitle blocks")
+        else:
+            print("  Warning: no boundary data from TTS", file=sys.stderr)
+            srt_path = None
+
+        print("\n[3/3] Generating video...")
+        generate_video(out, vid_path, srt_path)
+        if vid_path.exists():
+            print(f"  {vid_path.stat().st_size / (1024 * 1024):.1f} MB")
+
+        print("\nDone!")
+        return
+
     out, text = _resolve(args)
     srt_path = out.with_suffix(".srt")
     vid_path = out.with_suffix(".mp4")
@@ -379,6 +680,8 @@ def main() -> None:
     _add_common(bp)
 
     args = top.parse_args()
+    if args.command is not None:
+        _validate_multi_speaker_args(args, top)
     if args.command == "synth":
         _cmd_synth(args)
     elif args.command == "bundle":
