@@ -5,10 +5,16 @@ description = "Convert markdown files to audio with subtitles and video, powered
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["edge-tts>=7.0"]
+dependencies = [
+    "edge-tts>=7.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
 
 [tool.setuptools]
-py-modules = ["md2audio"]
+py-modules = ["md2audio", "md2audio_dialogue"]
 
 [project.scripts]
 md2audio = "md2audio:main"
