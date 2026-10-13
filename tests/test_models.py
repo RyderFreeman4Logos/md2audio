@@ -229,7 +229,9 @@ def test_plain_local_flag_and_model_choice_route_without_manual_path(tmp_path, m
         destination.write_bytes(b"local mp3")
         return [{"text": text, "offset": 0, "duration": 10_000_000}]
 
-    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=choose))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(
+        ensure_model=choose, ensure_native=lambda: "/installed/sherpa",
+    ))
     monkeypatch.setitem(sys.modules, "md2audio_local", SimpleNamespace(synthesize_local=local, LocalTTSError=RuntimeError))
     monkeypatch.setattr(md2audio.shutil, "which", lambda name: "/installed/" + name)
     monkeypatch.setattr(md2audio, "synthesize", lambda *args: pytest.fail("Edge called in local mode"))
@@ -281,7 +283,10 @@ def test_local_input_and_native_dependencies_validate_before_download(tmp_path, 
     output = tmp_path / "audio.mp3"
     output.write_bytes(b"original mp3")
     requests: list[str] = []
-    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=lambda name: requests.append(name)))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(
+        ensure_model=lambda name: requests.append(name), LocalTTSError=RuntimeError,
+        ensure_native=lambda: pytest.fail("Invalid input prepared native runtime"),
+    ))
     monkeypatch.setattr(md2audio.shutil, "which", lambda name: None if reason == "dependency" else "/installed/" + name)
     monkeypatch.setattr(sys, "argv", ["md2audio", str(source), "--local-tts", "-o", str(output)])
     with pytest.raises(SystemExit) as exc:
@@ -336,7 +341,7 @@ def test_world_writable_data_ancestor_is_refused_without_network(models, tmp_pat
     directory.mkdir(mode=0o777)
     directory.chmod(0o777)
     monkeypatch.setenv("XDG_DATA_HOME", str(directory / "data"))
-    with pytest.raises(RuntimeError, match="Unsafe model directory"):
+    with pytest.raises(RuntimeError, match="Unsafe local TTS directory"):
         module.ensure_model("melo")
     assert not (directory / "data").exists() and downloads == []
 
@@ -352,7 +357,7 @@ def test_hidden_untrusted_symlink_hop_is_refused_without_external_changes(models
     link = tmp_path / "configured-data"
     link.symlink_to(unsafe / "next")
     monkeypatch.setenv("XDG_DATA_HOME", str(link))
-    with pytest.raises(RuntimeError, match="Unsafe model directory"):
+    with pytest.raises(RuntimeError, match="Unsafe local TTS directory"):
         module.ensure_model("melo")
     assert list(external.iterdir()) == [] and link.is_symlink() and downloads == []
 
@@ -373,7 +378,7 @@ def test_foreign_owned_ancestor_is_refused_before_network(models, tmp_path, monk
 
     monkeypatch.setattr(Path, "lstat", stat)
     monkeypatch.setenv("XDG_DATA_HOME", str(directory / "data"))
-    with pytest.raises(RuntimeError, match="Unsafe model directory"):
+    with pytest.raises(RuntimeError, match="Unsafe local TTS directory"):
         module.ensure_model("melo")
     assert not (directory / "data").exists() and downloads == []
 
@@ -403,7 +408,9 @@ def test_model_download_failure_keeps_original_cli_output(tmp_path, monkeypatch)
     def unavailable(name):
         raise RuntimeError("model download unavailable")
 
-    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=unavailable))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(
+        ensure_model=unavailable, ensure_native=lambda: "/installed/sherpa", LocalTTSError=RuntimeError,
+    ))
     monkeypatch.setattr(md2audio.shutil, "which", lambda name: "/installed/" + name)
     monkeypatch.setattr(sys, "argv", ["md2audio", "--local-tts", str(source), "-o", str(output)])
     with pytest.raises(SystemExit) as exc:
@@ -513,7 +520,7 @@ def test_termux_system_ancestry_is_narrowly_admitted(models, monkeypatch, platfo
     if valid:
         assert module._safe_directory(path) == path
     else:
-        with pytest.raises(RuntimeError, match="Unsafe model directory"):
+        with pytest.raises(RuntimeError, match="Unsafe local TTS directory"):
             module._safe_directory(path)
 
 

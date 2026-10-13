@@ -65,7 +65,7 @@ def test_local_cli_routes_offline_with_default_or_selected_gain(
         pytest.fail("local CLI contacted Edge")
 
     monkeypatch.setitem(sys.modules, "md2audio_local", SimpleNamespace(synthesize_local=local, LocalTTSError=RuntimeError))
-    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=lambda name: model))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=lambda name: model, ensure_native=lambda: "/fixture/sherpa"))
     monkeypatch.setattr(md2audio.shutil, "which", lambda name: "/fixture/" + name)
     monkeypatch.setattr(md2audio, "synthesize", forbidden)
     monkeypatch.setattr(md2audio, "fetch_voices", forbidden)
@@ -99,6 +99,7 @@ def test_local_cli_rejects_incompatible_selectors_before_input_io(
 @pytest.fixture
 def native_tts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     """Exercise the real executable boundary with deterministic PCM, without ONNX."""
+    import md2audio_local
     model = tmp_path / "renamed model"
     model.mkdir()
     for name in ("model.onnx", "lexicon.txt", "tokens.txt", "date.fst", "number.fst"):
@@ -110,6 +111,8 @@ import json, math, os, struct, sys, wave
 from pathlib import Path
 with open(os.environ["TTS_TEST_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
+if os.environ.get("TTS_TEST_ENV"):
+    Path(os.environ["TTS_TEST_ENV"]).write_text(os.environ.get("LD_LIBRARY_PATH", ""))
 if os.environ.get("TTS_TEST_FAIL"):
     print("native fixture failure", file=sys.stderr)
     sys.exit(3)
@@ -130,7 +133,7 @@ if os.environ.get("TTS_TEST_TRUNCATE"):
     executable.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("TTS_TEST_LOG", str(log))
-    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=lambda name: model))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=lambda name: model, ensure_native=lambda: str(executable)))
     return model, log
 
 
@@ -161,6 +164,56 @@ def test_local_native_cli_chunks_utf8_applies_gain_once_and_writes_real_mp3(
         "1\n00:00:00,000 --> "
     )
     assert not list(tmp_path.glob(".result.*"))
+
+
+def test_local_missing_path_runtime_is_prepared_lazily_and_invoked_directly(
+    native_tts: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import shutil
+    import md2audio_local
+    model, log = native_tts
+    runtime = tmp_path / "sherpa-onnx-offline-tts"
+    original_which = shutil.which
+    calls: list[str] = []
+
+    def prepare() -> str:
+        calls.append("native")
+        return str(runtime)
+
+    monkeypatch.setattr(shutil, "which", lambda name: None if name == "sherpa-onnx-offline-tts"
+                        else original_which(name))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(
+        ensure_model=lambda name: model, ensure_native=prepare,
+    ))
+    monkeypatch.setattr(md2audio_local, "ensure_native", prepare, raising=False)
+    source = tmp_path / "input.md"
+    source.write_text("你好。", encoding="utf-8")
+    output = tmp_path / "first-use.mp3"
+    environment = tmp_path / "native-env.txt"
+    monkeypatch.setenv("TTS_TEST_ENV", str(environment))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/original/library-path")
+    monkeypatch.setattr(sys, "argv", ["md2audio", str(source), "-o", str(output),
+                                    "--local-tts", "--volume", "1.0", "--srt"])
+    md2audio.main()
+    assert calls == ["native", "native"]
+    assert len(log.read_text().splitlines()) == 1
+    assert output.stat().st_size > 0
+    subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-f", "null", "-"],
+                   check=True, capture_output=True)
+    assert output.with_suffix(".srt").is_file()
+    assert environment.read_text() == str(runtime.parent) + os.pathsep + "/original/library-path"
+    assert os.environ["LD_LIBRARY_PATH"] == "/original/library-path"
+
+
+def test_existing_path_native_keeps_its_original_library_environment(native_tts, tmp_path, monkeypatch) -> None:
+    from md2audio_local import synthesize_local
+    model, _ = native_tts
+    environment = tmp_path / "existing-native-env.txt"
+    monkeypatch.setenv("TTS_TEST_ENV", str(environment))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/original/library-path")
+    synthesize_local("你好。", model, "0", 1.0, tmp_path / "existing.mp3", "1.00")
+    assert environment.read_text() == "/original/library-path"
+    assert os.environ["LD_LIBRARY_PATH"] == "/original/library-path"
 
 
 def test_local_speaker_ids_use_sidecar_order_and_reject_silent_fallback(
@@ -232,7 +285,7 @@ def test_local_missing_model_or_dependency_is_actionable_and_keeps_output(
         synthesize_local("你好。", model, "0", 1.0, output)
     tokens.write_text("fixture", encoding="utf-8")
     monkeypatch.setenv("PATH", "")
-    with pytest.raises(LocalTTSError, match="sherpa-onnx-offline-tts not found on PATH"):
+    with pytest.raises(LocalTTSError, match="ffmpeg not found on PATH"):
         synthesize_local("你好。", model, "0", 1.0, output)
     assert not log.exists()
     assert output.read_bytes() == b"original"
