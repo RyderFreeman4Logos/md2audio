@@ -103,13 +103,13 @@ Unit tests mock all Edge voice and synthesis calls, so they do not use the
 network:
 
 ```bash
-.venv/bin/python -m pytest -q
+just check
 ```
 
 Optional live smoke test (save the dialogue example above as `transcript.md`; this
 requires network access to Edge TTS):
 
 ```bash
-md2audio synth transcript.md -o /tmp/dialogue.mp3 \
+md2audio synth transcript.md -o ~/tmp/dialogue.mp3 \
   --multi-speaker --speaker-gender male --speaker-language en --seed 42
 ```
