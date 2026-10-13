@@ -269,6 +269,84 @@ def test_cached_native_version_symlink_validates_its_final_library_directory(
     assert len(native[2]) == 1
 
 
+@pytest.mark.parametrize("case", [
+    "sticky-origin", "sticky-sibling-parent", "sticky-third-parent",
+    "sibling-alias", "third-alias", "extra-origin", "writable-sibling-file", "linked-third-file",
+    "private-control", "sticky-readonly-control", "safe-version-alias", "safe-sibling-alias",
+])
+def test_native_loader_namespaces_reject_peer_candidates_without_mutating_cache(
+    native, tmp_path, monkeypatch, case,
+) -> None:
+    executable = Path(md2audio_models.ensure_native())
+    origin = executable.parent
+    sibling = origin.parent / "lib"
+    third = origin.parents[2] / "sherpa_onnx"
+    if case == "sticky-origin":
+        origin.chmod(0o1777)
+    elif case in {"sticky-sibling-parent", "safe-version-alias"}:
+        shared = tmp_path / "shared"
+        shared.mkdir(mode=0o700)
+        target = shared / "release"
+        origin.rename(target)
+        origin.symlink_to(os.path.relpath(target, origin.parent), target_is_directory=True)
+        if case == "sticky-sibling-parent":
+            shared.chmod(0o1777)
+    elif case in {"sticky-third-parent", "sticky-readonly-control"}:
+        origin.parents[2].chmod(0o1777 if case == "sticky-third-parent" else 0o1755)
+    elif case in {"sibling-alias", "third-alias", "safe-sibling-alias"}:
+        target = tmp_path / "library-target"
+        target.mkdir(mode=0o700 if case == "safe-sibling-alias" else 0o777)
+        target.chmod(0o700 if case == "safe-sibling-alias" else 0o777)
+        (third if case == "third-alias" else sibling).symlink_to(target, target_is_directory=True)
+    elif case == "extra-origin":
+        (origin / "libstdc++.so.6").write_bytes(b"unpinned dependency")
+    elif case == "writable-sibling-file":
+        sibling.mkdir(mode=0o700)
+        library = sibling / "libstdc++.so.6"
+        library.write_bytes(b"peer writable dependency")
+        library.chmod(0o666)
+    elif case == "linked-third-file":
+        (third / "lib").mkdir(parents=True, mode=0o700)
+        (third / "lib/libstdc++.so.6").symlink_to(executable)
+
+    def snapshot():
+        result = {}
+        for path in tmp_path.rglob("*"):
+            metadata = path.lstat()
+            result[str(path)] = (metadata.st_ino, metadata.st_uid, metadata.st_gid, metadata.st_mode,
+                                 metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+                                 path.read_bytes() if path.is_file() else None)
+        return result
+
+    before = snapshot()
+    monkeypatch.setattr(md2audio_models, "build_opener", lambda *args: pytest.fail("Loader validation contacted network"))
+    if case.endswith("control") or case.startswith("safe-"):
+        assert md2audio_models.ensure_native() == str(origin.resolve() / executable.name)
+    else:
+        with pytest.raises(RuntimeError, match="library|runtime"):
+            md2audio_models.ensure_native()
+    assert snapshot() == before and len(native[2]) == 1
+
+
+@pytest.mark.parametrize("case", ["sticky-xdg", "unsafe-third-alias"])
+def test_unsafe_native_loader_namespace_is_refused_before_first_download(native, tmp_path, case) -> None:
+    data = tmp_path / "data"
+    data.mkdir(mode=0o700)
+    if case == "sticky-xdg":
+        data.chmod(0o1777)
+    else:
+        target = tmp_path / "unsafe"
+        target.mkdir(mode=0o777)
+        target.chmod(0o777)
+        (data / "sherpa_onnx").symlink_to(target, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="library"):
+        md2audio_models.ensure_native()
+    assert native[2] == []
+    assert not (data / "md2audio/native/test-runtime").exists()
+    assert not list(data.glob("md2audio/native/.test-runtime.download-*"))
+    assert not (data / "sherpa_onnx/lib").exists()
+
+
 def test_native_failed_acquisition_keeps_original_cli_mp3(tmp_path, monkeypatch) -> None:
     import md2audio
     source = tmp_path / "input.md"

@@ -43,6 +43,9 @@ ARM64 Termux on Android 8.1/API 27 or later (about 16 MB). The
 provides the pinned shared bundles used here. Other platforms can use a
 manually installed native CLI on `PATH`. FFmpeg remains a prerequisite and is
 not downloaded by md2audio.
+Managed native versions contain only the two pinned files. Their cache-relative
+library search directories must prevent writes by other users; unsafe caches are
+preserved and refused. Safe directory symlinks remain supported.
 
 The default [Melo Chinese-English VITS model](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/vits.html)
 has one voice. Omit `--voice` to retain speaker 0. Local volume defaults to

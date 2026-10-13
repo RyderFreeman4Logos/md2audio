@@ -75,8 +75,8 @@ class _HTTPSRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _safe_directory(path: Path) -> Path:
-    """Admit every namespace hop and create private missing directories; retain symlinks."""
+def _safe_directory(path: Path, *, library_search: bool = False) -> Path:
+    """Admit namespace hops; library searches only inspect a protected existing prefix."""
     current = Path(path.anchor)
     pending = deque(path.parts[1:])
     links = 0
@@ -92,6 +92,8 @@ def _safe_directory(path: Path) -> Path:
         try:
             metadata = candidate.lstat()
         except FileNotFoundError:
+            if library_search:
+                return _safe_directory(current, library_search=True)
             try:
                 candidate.mkdir(mode=0o700)
             except FileExistsError:
@@ -124,11 +126,14 @@ def _safe_directory(path: Path) -> Path:
             (metadata.st_uid == os.getuid() == os.getgid() and android_private is not None and
              candidate.is_relative_to(android_private)) or
             (system_path and metadata.st_uid == metadata.st_gid == 1000))
-        unsafe_mode = metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX
+        unsafe_mode = metadata.st_mode & 0o022 and (
+            (library_search and not pending) or not metadata.st_mode & stat.S_ISVTX)
         if (not stat.S_ISDIR(metadata.st_mode) or
                 (unsafe_mode and not (android_group and not metadata.st_mode & 0o002))):
             raise LocalTTSError(f"Unsafe local TTS directory permissions or type: {candidate}")
         current = candidate
+    if library_search and current != path:
+        return _safe_directory(current, library_search=True)
     return current
 
 
@@ -152,6 +157,8 @@ def _verify_files(directory: Path, files: dict[str, tuple[int, str]], executable
                 raise LocalTTSError(f"Corrupt cached local TTS file: {directory / name}")
             if name == executable and not metadata.st_mode & stat.S_IXUSR:
                 raise LocalTTSError(f"Cached local TTS runtime is not executable: {directory / name}")
+    if executable and {entry.name for entry in directory.iterdir()} != {PurePosixPath(name).name for name in files}:
+        raise LocalTTSError(f"Unexpected file in cached local TTS runtime: {directory}; preserve it before retrying")
 
 
 def _download(url: str, output: Path, size: int, expected: str, label: str) -> None:
@@ -241,6 +248,9 @@ def ensure_native() -> str:
     offline. Returns the absolute executable path, without changing PATH or any
     system installation. The caller must prioritize its adjacent library for the
     managed runtime's child process only; FFmpeg and Termux libc++ remain prerequisites.
+    The managed version contains only the two pinned files. Its three cache-relative
+    library search namespaces must exclude peer-writable directories and candidates;
+    missing search branches are inspected without creating them. Safe directory aliases stay intact.
     """
     installed = shutil.which("sherpa-onnx-offline-tts")
     if installed is not None:
@@ -268,6 +278,24 @@ def _validate_library_directory(directory: Path) -> None:
     if any(character in str(directory) for character in (":", ";", "$")):
         raise LocalTTSError(f"Native cache directory cannot be represented in the child library search path: {directory}; "
                             "':' and ';' separate directories, and '$' expands loader tokens")
+
+
+def _validate_native_directory(directory: Path) -> None:
+    """Admit the three cache namespaces embedded in both pinned official ELF bundles."""
+    _validate_library_directory(directory)
+    # Use canonical ORIGIN, including version symlink targets, for the fixed RPATH/RUNPATH.
+    for search in (directory, directory.parent / "lib",
+                   directory.parent.parent.parent / "sherpa_onnx/lib"):
+        try:
+            existing = _safe_directory(search, library_search=True)
+            if search != directory and search.exists():
+                for entry in existing.iterdir():
+                    metadata = entry.lstat()
+                    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()} or
+                            metadata.st_mode & 0o022):
+                        raise LocalTTSError(f"Unsafe cached native library candidate: {entry}")
+        except (OSError, LocalTTSError) as exc:
+            raise LocalTTSError(f"Unsafe native library search location {search}: {exc}") from exc
 
 
 def _ensure_asset(top: str, archive_size: int, archive_hash: str, expanded_limit: int,
@@ -299,13 +327,15 @@ def _ensure_asset(top: str, archive_size: int, archive_hash: str, expanded_limit
             if directory.exists() or directory.is_symlink():
                 directory = _safe_directory(directory)
                 if executable:
-                    _validate_library_directory(directory)
+                    _validate_native_directory(directory)
                 try:
                     _verify_files(directory, files, executable)
                 except (OSError, LocalTTSError) as exc:
                     raise LocalTTSError(f"Incomplete or corrupt cached {label} at {directory}; "
                                         f"rename that directory to preserve it, then retry: {exc}") from exc
                 return directory
+            if executable:
+                _validate_native_directory(directory)
             with tempfile.TemporaryDirectory(prefix=f".{top}.download-", dir=root) as work:
                 archive = Path(work) / "asset.tar.bz2"
                 staged = Path(work) / top
