@@ -58,7 +58,8 @@ md2audio news.txt -o another-voice.mp3 \
 
 Local mode supports `synth`, `bundle`, subtitles, and video, but currently
 rejects `--multi-speaker`. It groups text at sentence breaks into chunks of at
-most 400 characters, bounds each native process to 300 seconds, and replaces
+most 400 characters, gives each native process 300 seconds plus up to 5 seconds
+for cleanup (reporting unsettled cleanup on failure), and replaces
 the requested MP3 only after every chunk and conversion succeeds. The CLI
 reloads its model per chunk, adding startup cost on long documents. Subtitles
 use measured WAV durations at chunk boundaries and approximate timing within

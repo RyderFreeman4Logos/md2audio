@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -270,6 +272,198 @@ def test_local_text_that_looks_like_flags_stays_literal(
     assert call[-2:] == ["--", text]
     assert boundaries[0]["text"] == text
     assert output.exists() and not escape.exists()
+
+
+def test_local_nonzero_exit_signals_only_while_leader_identity_is_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import md2audio_local
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    events: list[str] = []
+
+    class ExitedProcess:
+        pid = 12345
+        stderr = os.fdopen(read_fd, "rb", buffering=0)
+        reaped = False
+
+        def poll(self):
+            events.append("poll-reap")
+            self.reaped = True
+            return 3
+
+        def wait(self, timeout=None):
+            events.append("wait-reap")
+            self.reaped = True
+            return 3
+
+    process = ExitedProcess()
+
+    def observe(*args):
+        assert not process.reaped
+        events.append("observe-unreaped")
+        return SimpleNamespace(si_pid=process.pid, si_status=3)
+
+    def signal_group(*args):
+        assert not process.reaped, "must never signal a group after reaping its leader"
+        events.append("signal-group")
+
+    monkeypatch.setattr(md2audio_local.subprocess, "Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(md2audio_local.os, "waitid", observe)
+    monkeypatch.setattr(md2audio_local.os, "killpg", signal_group)
+    with pytest.raises(md2audio_local.LocalTTSError, match="exited 3"):
+        md2audio_local._run_process(["fixture"])
+    assert events.index("signal-group") < events.index("wait-reap")
+    assert "poll-reap" not in events
+
+
+def test_local_cleanup_has_its_own_bound_and_reports_unsettled_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import md2audio_local
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    waits: list[float] = []
+    signals: list[int] = []
+
+    class StalledProcess:
+        pid = 12345
+        stderr = os.fdopen(read_fd, "rb", buffering=0)
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            assert timeout is not None and 0 < timeout <= 5, "cleanup waits must be bounded"
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired("fixture", timeout)
+
+    process = StalledProcess()
+    clock = iter([0.0, 301.0, 301.0, 301.1, 301.2, 306.1])
+    monkeypatch.setattr(md2audio_local.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(md2audio_local.subprocess, "Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(md2audio_local.os, "waitid", lambda *a: None)
+    monkeypatch.setattr(md2audio_local.os, "killpg", lambda pid, sig: signals.append(sig))
+    with pytest.raises(md2audio_local.LocalTTSError, match="cleanup.*unsettled"):
+        md2audio_local._run_process(["fixture"])
+    assert len(signals) == 1 and waits
+
+
+def test_local_cleanup_retries_second_interrupt_before_mandatory_signal_and_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import md2audio_local
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    events: list[str] = []
+
+    class InterruptedProcess:
+        pid = 12345
+        stderr = os.fdopen(read_fd, "rb", buffering=0)
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            assert timeout is not None and timeout > 0
+            if "wait-interrupt" not in events:
+                events.append("wait-interrupt")
+                raise KeyboardInterrupt
+            events.append("reaped")
+            return -9
+
+    process = InterruptedProcess()
+    clock = iter([0.0, 301.0, 301.0, 301.1, 301.2, 301.3, 301.4, 301.5])
+
+    def signal_group(*args):
+        if "signal-interrupt" not in events:
+            events.append("signal-interrupt")
+            raise KeyboardInterrupt
+        events.append("signal-sent")
+
+    monkeypatch.setattr(md2audio_local.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(md2audio_local.subprocess, "Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(md2audio_local.os, "waitid", lambda *a: None)
+    monkeypatch.setattr(md2audio_local.os, "killpg", signal_group)
+    try:
+        with pytest.raises(md2audio_local.LocalTTSError, match="timed out"):
+            md2audio_local._run_process(["fixture"])
+    except KeyboardInterrupt:
+        pytest.fail("cleanup allowed a second interruption to escape before termination")
+    assert events == ["signal-interrupt", "signal-sent", "wait-interrupt", "reaped"]
+
+
+def test_local_descendant_held_stderr_is_killed_before_reaping_the_exited_leader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import md2audio_local
+    descendant_pid = tmp_path / "descendant.pid"
+    roots: list[subprocess.Popen] = []
+    signals: list[int] = []
+    popen = subprocess.Popen
+    killpg = os.killpg
+    waitid = os.waitid
+
+    def spawn(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        roots.append(process)
+        return process
+
+    def signal_owned_group(pid: int, sig: int):
+        observed = waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        assert observed is not None and observed.si_pid == pid and observed.si_status == 3
+        signals.append(pid)
+        return killpg(pid, sig)
+
+    monkeypatch.setattr(md2audio_local.subprocess, "Popen", spawn)
+    monkeypatch.setattr(md2audio_local.os, "killpg", signal_owned_group)
+    monkeypatch.setattr(md2audio_local, "_PROCESS_TIMEOUT_SECONDS", 0.3)
+    script = """import subprocess, sys
+from pathlib import Path
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+Path(sys.argv[1]).write_text(str(child.pid))
+sys.exit(3)
+"""
+    try:
+        with pytest.raises(md2audio_local.LocalTTSError, match="timed out"):
+            md2audio_local._run_process([sys.executable, "-c", script, str(descendant_pid)])
+        assert roots[0].returncode == 3 and signals == [roots[0].pid]
+        with pytest.raises(ChildProcessError):
+            os.waitpid(roots[0].pid, os.WNOHANG)
+        child = int(descendant_pid.read_text())
+        state = Path(f"/proc/{child}/stat")
+        deadline = time.monotonic() + 2
+        while state.exists() and state.read_text().split(")", 1)[1].split()[0] != "Z":
+            assert time.monotonic() < deadline, "signaled descendant did not terminate"
+            threading.Event().wait(0.01)
+        assert not state.exists() or state.read_text().split(")", 1)[1].split()[0] == "Z"
+    finally:
+        if roots and roots[0].returncode is None:
+            killpg(roots[0].pid, 9)
+            roots[0].wait(timeout=5)
+
+
+def test_local_cleanup_blocks_sigint_and_restores_the_callers_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import md2audio_local
+    masks: list[tuple] = []
+    old_mask = {md2audio_local.signal.SIGTERM}
+
+    def mask(operation, signals):
+        masks.append((operation, signals))
+        return old_mask
+
+    def wait(timeout):
+        assert masks == [(md2audio_local.signal.SIG_BLOCK, {md2audio_local.signal.SIGINT})]
+        return 0
+
+    process = SimpleNamespace(pid=12345, wait=wait)
+    monkeypatch.setattr(md2audio_local.signal, "pthread_sigmask", mask)
+    monkeypatch.setattr(md2audio_local.os, "waitid", lambda *args: None)
+    monkeypatch.setattr(md2audio_local.os, "killpg", lambda *args: None)
+    assert md2audio_local._terminate_and_reap(process) == 0
+    assert masks[-1] == (md2audio_local.signal.SIG_SETMASK, old_mask)
 
 
 def test_local_timeout_kills_reaps_and_preserves_output(

@@ -16,6 +16,7 @@ from pathlib import Path
 __all__ = ["LocalTTSError", "synthesize_local"]
 
 _PROCESS_TIMEOUT_SECONDS = 300
+_CLEANUP_TIMEOUT_SECONDS = 5
 # shortcut: the CLI reloads the model per chunk; use a persistent runtime if long-document latency becomes limiting.
 _MAX_CHUNK_CHARS = 400
 _TICKS_PER_SECOND = 10_000_000
@@ -23,6 +24,38 @@ _TICKS_PER_SECOND = 10_000_000
 
 class LocalTTSError(RuntimeError):
     """A local dependency, model, or synthesis process could not complete."""
+
+
+def _terminate_and_reap(process: subprocess.Popen[bytes]) -> int:
+    """Signal while the unreaped leader pins its group, then settle within 5s."""
+    # Defer repeated Ctrl-C until mandatory termination and reaping have finished.
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
+        signaled = False
+        while time.monotonic() < deadline:
+            try:
+                if not signaled:
+                    # WNOWAIT preserves the PID even when the leader has already exited.
+                    os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    signaled = True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                return process.wait(timeout=remaining)
+            except KeyboardInterrupt:
+                continue
+            except subprocess.TimeoutExpired:
+                break
+            except (ChildProcessError, OSError) as exc:
+                raise LocalTTSError(f"Native process cleanup unsettled: {exc}") from exc
+        raise LocalTTSError(f"Native process cleanup unsettled after {_CLEANUP_TIMEOUT_SECONDS}s")
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _run_process(command: list[str]) -> None:
@@ -40,7 +73,8 @@ def _run_process(command: list[str]) -> None:
             selector.register(process.stderr, selectors.EVENT_READ)
             os.set_blocking(process.stderr.fileno(), False)
             deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
-            while selector.get_map() or process.poll() is None:
+            exited = False
+            while selector.get_map() or not exited:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise LocalTTSError(f"{Path(command[0]).name} timed out after {_PROCESS_TIMEOUT_SECONDS}s")
@@ -50,17 +84,16 @@ def _run_process(command: list[str]) -> None:
                         tail = (tail + data)[-2048:]
                     else:
                         selector.unregister(key.fileobj)
-            returncode = process.wait()
+                exited = os.waitid(os.P_PID, process.pid,
+                                   os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except BaseException:
+        _terminate_and_reap(process)
+        raise
+    else:
+        returncode = _terminate_and_reap(process)
         if returncode:
             raise LocalTTSError(f"{Path(command[0]).name} exited {returncode}: "
                                 f"{tail.decode('utf-8', errors='replace').strip()}")
-    except BaseException:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        raise
     finally:
         if process.stderr is not None:
             process.stderr.close()
@@ -94,7 +127,8 @@ def synthesize_local(
     ``model_dir`` contains model.onnx, lexicon.txt, and tokens.txt. A speakers.txt
     sidecar lists speaker names in zero-based ID order; without it only ID 0 is
     accepted. sherpa-onnx-offline-tts and ffmpeg must be installed on PATH.
-    Each bounded text chunk has a 300-second process deadline. Subtitle timing
+    Each chunk has a 300-second run deadline plus up to 5s for cleanup, which
+    reports an unsettled-cleanup error if reaping cannot be established. Subtitle timing
     is exact at chunk boundaries; intra-chunk timing is estimated by the caller.
     The existing output is retained on any failure, with no online fallback.
     """
