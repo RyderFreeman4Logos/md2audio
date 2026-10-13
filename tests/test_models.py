@@ -224,7 +224,7 @@ def test_plain_local_flag_and_model_choice_route_without_manual_path(tmp_path, m
         requests.append(name)
         return model
 
-    def local(text, selected_model, speaker, speed, destination, volume):
+    def local(text, selected_model, speaker, speed, destination, volume, threads=None):
         calls.append((text, selected_model, speaker, volume))
         destination.write_bytes(b"local mp3")
         return [{"text": text, "offset": 0, "duration": 10_000_000}]

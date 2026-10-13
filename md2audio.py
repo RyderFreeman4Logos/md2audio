@@ -695,6 +695,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help=f"Edge voice (default: {DEFAULT_VOICE}); local mode: speaker ID (default: 0)")
     g.add_argument("--volume", type=_volume_multiplier, metavar="MULTIPLIER",
                    help="Local mode only: nonnegative volume multiplier, up to two decimals (default: 2.00)")
+    g.add_argument("--threads", type=int, metavar="N",
+                   help="Local mode only: positive thread count (default: CPUs available to this process)")
     g.add_argument("--speed", type=float, default=DEFAULT_SPEED,
                    help=f"Speed multiplier (default: {DEFAULT_SPEED})")
     g = p.add_argument_group("Processing")
@@ -830,11 +832,15 @@ def _validate_multi_speaker_args(args, parser: argparse.ArgumentParser) -> None:
 def _validate_local_tts_args(args, parser: argparse.ArgumentParser) -> None:
     """Reject local-only options and unsupported combinations before input IO."""
     if not args.local_tts:
+        if args.threads is not None:
+            parser.error("--threads requires --local-tts")
         if args.volume is not None:
             parser.error("--volume requires --local-tts")
         if args.local_model is not None:
             parser.error("--local-model requires --local-tts")
         return
+    if args.threads is not None and args.threads <= 0:
+        parser.error("local --threads must be a positive integer")
     if args.multi_speaker:
         parser.error("--local-tts does not support --multi-speaker")
     if args.voice is not None and re.fullmatch(r"[0-9]+", args.voice) is None:
@@ -918,7 +924,8 @@ def _cmd_synth(args) -> None:
         from md2audio_local import synthesize_local
         try:
             model_dir = _local_model_for_input(args, text)
-            bounds = synthesize_local(text, model_dir, voice, args.speed, out, args.volume or "2.00")
+            bounds = synthesize_local(text, model_dir, voice, args.speed, out, args.volume or "2.00",
+                                      threads=args.threads)
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -998,7 +1005,8 @@ def _cmd_bundle(args) -> None:
         from md2audio_local import synthesize_local
         try:
             model_dir = _local_model_for_input(args, text)
-            bounds = synthesize_local(text, model_dir, voice, args.speed, out, args.volume or "2.00")
+            bounds = synthesize_local(text, model_dir, voice, args.speed, out, args.volume or "2.00",
+                                      threads=args.threads)
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)

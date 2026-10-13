@@ -137,6 +137,7 @@ def _text_chunks(text: str) -> list[str]:
 
 def synthesize_local(
     text: str, model_dir: Path, speaker: str, speed: float, output: Path, volume: str = "2.00",
+    threads: int | None = None,
 ) -> list[dict]:
     """Atomically produce offline MP3 with one gain and measured chunk subtitle timing.
 
@@ -144,11 +145,21 @@ def synthesize_local(
     sidecar lists speaker names in zero-based ID order; without it only ID 0 is
     accepted. FFmpeg must be installed on PATH; missing sherpa-onnx-offline-tts
     is downloaded lazily into XDG user data on supported platforms.
+    ``threads`` must be a positive integer; by default use CPUs in the process
+    affinity mask, falling back to the system CPU count or one when unavailable.
     Each chunk has a 300-second run deadline plus up to 5s for cleanup, which
     reports an unsettled-cleanup error if reaping cannot be established. Subtitle timing
     is exact at chunk boundaries; intra-chunk timing is estimated by the caller.
     The existing output is retained on any failure, with no online fallback.
     """
+    if threads is not None and (type(threads) is not int or threads <= 0):
+        raise LocalTTSError("Local threads must be a positive integer")
+    if threads is None:
+        try:
+            threads = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            threads = os.cpu_count() or 1
+        threads = max(1, threads)
     if re.fullmatch(r"[0-9]+", speaker) is None:
         raise LocalTTSError("Local speaker ID must be a nonnegative integer")
     if not math.isfinite(speed) or speed <= 0:
@@ -201,7 +212,7 @@ def synthesize_local(
                 for index, chunk in enumerate(chunks, 1):
                     print(f"  Local chunk {index}/{len(chunks)} (speaker {sid})", flush=True)
                     wav_path = work / "chunk.wav"
-                    command = [sherpa, "--num-threads=2", f"--sid={sid}", f"--speed={speed}",
+                    command = [sherpa, f"--num-threads={threads}", f"--sid={sid}", f"--speed={speed}",
                                f"--vits-model={model_dir / 'model.onnx'}",
                                f"--vits-lexicon={model_dir / 'lexicon.txt'}",
                                f"--vits-tokens={model_dir / 'tokens.txt'}",
