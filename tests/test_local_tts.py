@@ -4,6 +4,7 @@ import argparse
 import array
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -464,6 +465,148 @@ def test_local_cleanup_blocks_sigint_and_restores_the_callers_mask(
     monkeypatch.setattr(md2audio_local.os, "killpg", lambda *args: None)
     assert md2audio_local._terminate_and_reap(process) == 0
     assert masks[-1] == (md2audio_local.signal.SIG_SETMASK, old_mask)
+
+
+def test_local_paragraph_subtitles_keep_all_text_in_valid_cues(
+    native_tts: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, log = native_tts
+    source = tmp_path / "paragraphs.md"
+    output = tmp_path / "paragraphs.mp3"
+    text = "第一段。\n\n第二段。\n\n第三段。"
+    source.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["md2audio", str(source), "--local-tts", str(model),
+                                    "-o", str(output), "--srt"])
+    md2audio.main()
+    cues = re.split(r"\n\s*\n", output.with_suffix(".srt").read_text().strip())
+    bodies: list[str] = []
+    for index, cue in enumerate(cues, 1):
+        lines = cue.splitlines()
+        assert lines[0] == str(index)
+        assert re.fullmatch(r"\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}", lines[1])
+        bodies.extend(lines[2:])
+    assert "".join("".join(bodies).split()) == "".join(text.split())
+    assert json.loads(log.read_text())[-1] == text
+
+
+def test_local_nul_text_is_rejected_before_native_invocation(
+    native_tts: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import md2audio_local
+    model, log = native_tts
+    output = tmp_path / "audio.mp3"
+    output.write_bytes(b"original")
+
+    def forbidden(*args):
+        pytest.fail("NUL input reached a native process")
+
+    monkeypatch.setattr(md2audio_local, "_run_process", forbidden)
+    with pytest.raises(md2audio_local.LocalTTSError, match="NUL"):
+        md2audio_local.synthesize_local("hello\x00world", model, "0", 1.0, output)
+    assert output.read_bytes() == b"original" and not log.exists()
+
+
+@pytest.mark.parametrize("phase", ["constructor", "handoff", "cleanup_entry"])
+def test_local_real_sigint_protects_spawn_handoff_and_cleanup_entry(phase: str) -> None:
+    """Send real SIGINT in a private probe; do not interrupt pytest or leak its children."""
+    script = '''
+import json, os, signal, subprocess, sys, time
+import md2audio_local
+phase = sys.argv[1]
+original_popen = subprocess.Popen
+original_cleanup = md2audio_local._terminate_and_reap
+old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+owned = []
+class ConstructorInterrupt(original_popen):
+    def _execute_child(self, *args, **kwargs):
+        super()._execute_child(*args, **kwargs)
+        owned.append(self)
+        os.kill(os.getpid(), signal.SIGINT)
+def handoff(*args, **kwargs):
+    child = original_popen(*args, **kwargs)
+    owned.append(child)
+    if phase == "handoff":
+        os.kill(os.getpid(), signal.SIGINT)
+    return child
+def cleanup(child):
+    os.kill(os.getpid(), signal.SIGINT)
+    return original_cleanup(child)
+md2audio_local.subprocess.Popen = ConstructorInterrupt if phase == "constructor" else handoff
+if phase == "cleanup_entry":
+    md2audio_local._PROCESS_TIMEOUT_SECONDS = 0.15
+    md2audio_local._terminate_and_reap = cleanup
+started = time.monotonic()
+interrupted = False
+try:
+    try:
+        md2audio_local._run_process([sys.executable, "-B", "-c", "import time; time.sleep(30)"])
+    except KeyboardInterrupt:
+        interrupted = True
+    result = {"interrupted": interrupted, "reaped_before_probe_cleanup": owned[0].returncode is not None,
+              "stderr_closed": owned[0].stderr.closed, "elapsed": time.monotonic() - started,
+              "mask_restored": signal.pthread_sigmask(signal.SIG_BLOCK, set()) == old_mask}
+finally:
+    for child in owned:
+        if child.returncode is None:
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=2)
+        if child.stderr is not None:
+            child.stderr.close()
+print(json.dumps(result))
+'''
+    probe = subprocess.run([sys.executable, "-B", "-c", script, phase], capture_output=True,
+                           text=True, timeout=8, check=True)
+    result = json.loads(probe.stdout)
+    assert result["interrupted"] and result["reaped_before_probe_cleanup"]
+    assert result["stderr_closed"] and result["mask_restored"]
+    assert result["elapsed"] < 2
+
+
+@pytest.mark.parametrize("mode", ["custom_handler", "caller_mask"])
+def test_local_real_sigint_preserves_the_callers_handler_and_mask(mode: str) -> None:
+    script = '''
+import json, os, signal, subprocess, sys
+import md2audio_local
+mode = sys.argv[1]
+handled = []
+if mode == "custom_handler":
+    signal.signal(signal.SIGINT, lambda signum, frame: handled.append(signum))
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+if mode == "caller_mask":
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+old_handler = signal.getsignal(signal.SIGINT)
+original_popen = subprocess.Popen
+owned = []
+def spawn(*args, **kwargs):
+    child = original_popen(*args, **kwargs)
+    owned.append(child)
+    os.kill(os.getpid(), signal.SIGINT)
+    return child
+md2audio_local.subprocess.Popen = spawn
+try:
+    md2audio_local._run_process([sys.executable, "-B", "-c", "pass"])
+    result = {"handler_unchanged": signal.getsignal(signal.SIGINT) is old_handler,
+              "mask_unchanged": signal.pthread_sigmask(signal.SIG_BLOCK, set()) == old_mask,
+              "pending": signal.SIGINT in signal.sigpending(), "handled": handled,
+              "reaped": owned[0].returncode == 0, "stderr_closed": owned[0].stderr.closed}
+finally:
+    for child in owned:
+        if child.returncode is None:
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=2)
+        child.stderr.close()
+print(json.dumps(result))
+'''
+    probe = subprocess.run([sys.executable, "-B", "-c", script, mode], capture_output=True,
+                           text=True, timeout=8, check=True)
+    result = json.loads(probe.stdout)
+    assert result["handler_unchanged"] and result["mask_unchanged"]
+    assert result["reaped"] and result["stderr_closed"]
+    assert result["pending"] == (mode == "caller_mask")
+    assert len(result["handled"]) == (1 if mode == "custom_handler" else 0)
 
 
 def test_local_timeout_kills_reaps_and_preserves_output(

@@ -7,6 +7,7 @@ import selectors
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import wave
@@ -27,7 +28,7 @@ class LocalTTSError(RuntimeError):
 
 
 def _terminate_and_reap(process: subprocess.Popen[bytes]) -> int:
-    """Signal while the unreaped leader pins its group, then settle within 5s."""
+    """Request group termination while its leader pins the ID; reap that leader within 5s."""
     # Defer repeated Ctrl-C until mandatory termination and reaping have finished.
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
@@ -59,44 +60,61 @@ def _terminate_and_reap(process: subprocess.Popen[bytes]) -> int:
 
 
 def _run_process(command: list[str]) -> None:
-    """Drain bounded diagnostic output and kill/reap the process group on failure."""
+    """Bound diagnostics and runtime, terminating the group and reaping its owned leader.
+
+    Real SIGINT stays blocked from before spawn through pipe closure. The bounded
+    run loop dispatches pending cancellation using the caller's handler and mask;
+    cleanup defers it until ownership is settled, including constructor/handoff.
+    """
     tail = b""
+    process: subprocess.Popen[bytes] | None = None
+    returncode = 0
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                   start_new_session=True)
-    except OSError as exc:
-        raise LocalTTSError(f"Cannot execute {command[0]}: {exc}") from exc
-    try:
-        with selectors.DefaultSelector() as selector:
-            if process.stderr is None:
-                raise LocalTTSError("Native process did not provide a diagnostic pipe")
-            selector.register(process.stderr, selectors.EVENT_READ)
-            os.set_blocking(process.stderr.fileno(), False)
-            deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
-            exited = False
-            while selector.get_map() or not exited:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise LocalTTSError(f"{Path(command[0]).name} timed out after {_PROCESS_TIMEOUT_SECONDS}s")
-                for key, _ in selector.select(min(remaining, 0.1)):
-                    data = os.read(key.fd, 8192)
-                    if data:
-                        tail = (tail + data)[-2048:]
-                    else:
-                        selector.unregister(key.fileobj)
-                exited = os.waitid(os.P_PID, process.pid,
-                                   os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-    except BaseException:
-        _terminate_and_reap(process)
-        raise
-    else:
-        returncode = _terminate_and_reap(process)
-        if returncode:
-            raise LocalTTSError(f"{Path(command[0]).name} exited {returncode}: "
-                                f"{tail.decode('utf-8', errors='replace').strip()}")
+        try:
+            try:
+                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                           start_new_session=True)
+            except OSError as exc:
+                raise LocalTTSError(f"Cannot execute {command[0]}: {exc}") from exc
+            with selectors.DefaultSelector() as selector:
+                if process.stderr is None:
+                    raise LocalTTSError("Native process did not provide a diagnostic pipe")
+                selector.register(process.stderr, selectors.EVENT_READ)
+                os.set_blocking(process.stderr.fileno(), False)
+                deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
+                exited = False
+                while selector.get_map() or not exited:
+                    if signal.SIGINT not in previous_mask and signal.SIGINT in signal.sigpending():
+                        handler = signal.getsignal(signal.SIGINT)
+                        if handler == signal.SIG_DFL:
+                            # Leave the fatal signal pending until resources have been settled.
+                            raise KeyboardInterrupt
+                        if signal.sigtimedwait({signal.SIGINT}, 0) is not None and callable(handler):
+                            handler(signal.SIGINT, sys._getframe())
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise LocalTTSError(f"{Path(command[0]).name} timed out after {_PROCESS_TIMEOUT_SECONDS}s")
+                    for key, _ in selector.select(min(remaining, 0.1)):
+                        data = os.read(key.fd, 8192)
+                        if data:
+                            tail = (tail + data)[-2048:]
+                        else:
+                            selector.unregister(key.fileobj)
+                    exited = os.waitid(os.P_PID, process.pid,
+                                       os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        finally:
+            if process is not None:
+                try:
+                    returncode = _terminate_and_reap(process)
+                finally:
+                    if process.stderr is not None:
+                        process.stderr.close()
     finally:
-        if process.stderr is not None:
-            process.stderr.close()
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    if returncode:
+        raise LocalTTSError(f"{Path(command[0]).name} exited {returncode}: "
+                            f"{tail.decode('utf-8', errors='replace').strip()}")
 
 
 def _text_chunks(text: str) -> list[str]:
@@ -138,6 +156,8 @@ def synthesize_local(
         raise LocalTTSError("Local speed must be finite and greater than zero")
     if re.fullmatch(r"[0-9]+(?:\.[0-9]{1,2})?", volume) is None:
         raise LocalTTSError("Local volume must be nonnegative with at most two decimal places")
+    if "\x00" in text:
+        raise LocalTTSError("Input contains a NUL character; remove it before local synthesis")
     chunks = _text_chunks(text)
     if not chunks:
         raise LocalTTSError("Input contains no speakable text")
@@ -201,7 +221,8 @@ def synthesize_local(
                         start = total_frames * _TICKS_PER_SECOND // source.getframerate()
                         total_frames += source.getnframes()
                         end = total_frames * _TICKS_PER_SECOND // source.getframerate()
-                        boundaries.append({"text": chunk, "offset": start, "duration": end - start})
+                        boundaries.append({"text": " ".join(chunk.split()), "offset": start,
+                                           "duration": end - start})
                         read_bytes = 0
                         while data := source.readframes(65536):
                             if merged is None:
