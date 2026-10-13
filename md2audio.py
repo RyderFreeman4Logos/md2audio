@@ -12,7 +12,9 @@ import sys
 import tempfile
 import time
 import warnings
+from contextlib import aclosing
 from pathlib import Path
+from typing import BinaryIO
 
 import edge_tts
 from md2audio_dialogue import (
@@ -30,6 +32,7 @@ _SRT_MAX_CHARS = 35
 _SRT_MIN_CHARS = 10
 _SRT_SPLIT_TARGET = 20
 _TICKS_PER_SECOND = 10_000_000
+_SYNTHESIS_READ_TIMEOUT_SECONDS = 60
 _DIALOGUE_CACHE_SCHEMA_VERSION = 2
 _DIALOGUE_RETRY_ATTEMPTS = 5
 _DIALOGUE_MAX_RETRY_DELAY_SECONDS = 8
@@ -194,7 +197,7 @@ def _write_srt(srt_path: Path, content: str) -> Path | None:
 # ---------------------------------------------------------------------------
 
 def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
-    """Synthesize audio via edge-tts, returning word-boundary timing data."""
+    """Atomically synthesize audio with a per-read timeout, returning boundary timing data."""
     rate = f"{int((speed - 1) * 100):+d}%"
     comm = edge_tts.Communicate(text, voice, rate=rate)
 
@@ -205,27 +208,47 @@ def synthesize(text: str, voice: str, speed: float, output: Path) -> list[dict]:
     bounds: list[dict] = []
     t0 = time.monotonic()
 
-    with open(output, "wb") as f:
-        for chunk in comm.stream_sync():
-            if chunk["type"] == "audio":
-                f.write(chunk["data"])
-                written += len(chunk["data"])
-            elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
-                bounds.append({
-                    "offset": chunk["offset"],
-                    "duration": chunk["duration"],
-                    "text": chunk.get("text", ""),
-                })
-                chars += len(chunk.get("text", ""))
-                p = min(int(chars / total * 100), 99) if total else 0
-                if p > pct:
-                    pct = p
-                    mb = written / (1024 * 1024)
-                    elapsed = time.monotonic() - t0
-                    eta = elapsed / pct * (100 - pct) if pct > 0 else 0
-                    eta_s = f"~{_fmt_eta(eta)}" if pct > 0 else "?"
-                    line = f"  [{pct:3d}%] {mb:.1f} MB  {_fmt_eta(elapsed)} / {eta_s}"
-                    print(f"\r{line:<50}", end="", flush=True)
+    async def collect_stream(audio_file: BinaryIO) -> None:
+        nonlocal chars, written, pct
+        async with aclosing(comm.stream()) as stream:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        anext(stream), timeout=_SYNTHESIS_READ_TIMEOUT_SECONDS,
+                    )
+                except StopAsyncIteration:
+                    break
+                if chunk["type"] == "audio":
+                    audio_file.write(chunk["data"])
+                    written += len(chunk["data"])
+                elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+                    bounds.append({
+                        "offset": chunk["offset"],
+                        "duration": chunk["duration"],
+                        "text": chunk.get("text", ""),
+                    })
+                    chars += len(chunk.get("text", ""))
+                    p = min(int(chars / total * 100), 99) if total else 0
+                    if p > pct:
+                        pct = p
+                        mb = written / (1024 * 1024)
+                        elapsed = time.monotonic() - t0
+                        eta = elapsed / pct * (100 - pct) if pct > 0 else 0
+                        eta_s = f"~{_fmt_eta(eta)}" if pct > 0 else "?"
+                        line = f"  [{pct:3d}%] {mb:.1f} MB  {_fmt_eta(elapsed)} / {eta_s}"
+                        print(f"\r{line:<50}", end="", flush=True)
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.stem}.", suffix=f"{output.suffix}.partial", dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as audio_file:
+            asyncio.run(collect_stream(audio_file))
+        temporary.replace(output)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
     elapsed = time.monotonic() - t0
     line = f"  [100%] {written / (1024 * 1024):.1f} MB  total {_fmt_eta(elapsed)}"
