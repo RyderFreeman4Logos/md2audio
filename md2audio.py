@@ -852,16 +852,16 @@ def _validate_local_tts_args(args, parser: argparse.ArgumentParser) -> None:
 
 
 def _local_model_for_input(args, text: str) -> Path:
-    """Validate local input and installed tools before any model download or data IO."""
+    """Validate local input and FFmpeg before lazily preparing the runtime and model."""
     from md2audio_local import LocalTTSError
     if "\x00" in text:
         raise LocalTTSError("Input contains a NUL character; remove it before local synthesis")
     if not text.strip():
         raise LocalTTSError("Input contains no speakable text")
-    for name in ("sherpa-onnx-offline-tts", "ffmpeg"):
-        if shutil.which(name) is None:
-            raise LocalTTSError(f"{name} not found on PATH; install the native CLI before using --local-tts")
-    from md2audio_models import ensure_model
+    if shutil.which("ffmpeg") is None:
+        raise LocalTTSError("ffmpeg not found on PATH; install FFmpeg before using --local-tts")
+    from md2audio_models import ensure_model, ensure_native
+    ensure_native()
     return ensure_model(args.local_model or "melo")
 
 

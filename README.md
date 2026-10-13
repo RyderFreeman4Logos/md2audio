@@ -28,16 +28,21 @@ On the first local synthesis, md2audio downloads the default Melo Chinese-Englis
 model (about 167 MB) into `$XDG_DATA_HOME/md2audio/models/vits-melo-tts-zh_en`.
 If `XDG_DATA_HOME` is unset, empty, or relative, it uses
 `~/.local/share/md2audio/models/` instead. Installation, imports, `--help`, and
-Edge synthesis do not download models or touch this data directory. Later local
-runs verify and reuse the cached model without network access. Failed downloads
+Edge synthesis do not download models or runtimes, or touch this data directory.
+Later local runs verify and reuse the cached assets without network access. Failed downloads
 leave the requested MP3 intact and can be retried with the same command.
 
-Install `ffmpeg` and `libc++` in Termux, and put the native
-`sherpa-onnx-offline-tts` executable on `PATH`. The
+Install `ffmpeg` and `libc++` in Termux (`pkg install ffmpeg libc++`). If
+`sherpa-onnx-offline-tts` is already on `PATH`, md2audio reuses it. Otherwise,
+the first local synthesis automatically downloads the native CLI and its ONNX
+library into `$XDG_DATA_HOME/md2audio/native/` (default
+`~/.local/share/md2audio/native/`). No manual executable path or `PATH` changes
+are needed. Automatic acquisition supports Linux x86_64 (about 28 MB) and
+ARM64 Termux on Android 8.1/API 27 or later (about 16 MB). The
 [sherpa-onnx v1.13.8 release](https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.8)
-provides `sherpa-onnx-v1.13.8-android-aarch64-termux-static.tar.bz2` for native
-ARM64 Termux; Linux ARM64 binaries do not run directly on Android. These native
-tools must be installed before first use; md2audio downloads models only.
+provides the pinned shared bundles used here. Other platforms can use a
+manually installed native CLI on `PATH`. FFmpeg remains a prerequisite and is
+not downloaded by md2audio.
 
 The default [Melo Chinese-English VITS model](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/vits.html)
 has one voice. Omit `--voice` to retain speaker 0. Local volume defaults to
@@ -61,7 +66,7 @@ md2audio input.txt --local-tts --local-model aishell3 --voice 10 \
 
 `--local-model` and `--volume` require `--local-tts`. Without `--local-tts`,
 synthesis uses Edge. Local synthesis never contacts Edge or falls back to it
-on failure. Large volume gains can clip. Downloaded archives and cached model
+on failure. Large volume gains can clip. Downloaded archives and cached asset
 files are checked against pinned sizes and SHA256 hashes; if existing cached
 data is corrupt, md2audio reports its path and preserves it for manual recovery.
 

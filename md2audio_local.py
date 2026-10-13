@@ -14,6 +14,8 @@ import wave
 from contextlib import ExitStack
 from pathlib import Path
 
+from md2audio_models import LocalTTSError, ensure_native
+
 __all__ = ["LocalTTSError", "synthesize_local"]
 
 _PROCESS_TIMEOUT_SECONDS = 300
@@ -21,10 +23,6 @@ _CLEANUP_TIMEOUT_SECONDS = 5
 # shortcut: the CLI reloads the model per chunk; use a persistent runtime if long-document latency becomes limiting.
 _MAX_CHUNK_CHARS = 400
 _TICKS_PER_SECOND = 10_000_000
-
-
-class LocalTTSError(RuntimeError):
-    """A local dependency, model, or synthesis process could not complete."""
 
 
 def _terminate_and_reap(process: subprocess.Popen[bytes]) -> int:
@@ -59,7 +57,7 @@ def _terminate_and_reap(process: subprocess.Popen[bytes]) -> int:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def _run_process(command: list[str]) -> None:
+def _run_process(command: list[str], *, env: dict[str, str] | None = None) -> None:
     """Bound diagnostics and runtime, terminating the group and reaping its owned leader.
 
     Real SIGINT stays blocked from before spawn through pipe closure. The bounded
@@ -74,7 +72,7 @@ def _run_process(command: list[str]) -> None:
         try:
             try:
                 process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                           start_new_session=True)
+                                           start_new_session=True, env=env)
             except OSError as exc:
                 raise LocalTTSError(f"Cannot execute {command[0]}: {exc}") from exc
             with selectors.DefaultSelector() as selector:
@@ -144,7 +142,8 @@ def synthesize_local(
 
     ``model_dir`` contains model.onnx, lexicon.txt, and tokens.txt. A speakers.txt
     sidecar lists speaker names in zero-based ID order; without it only ID 0 is
-    accepted. sherpa-onnx-offline-tts and ffmpeg must be installed on PATH.
+    accepted. FFmpeg must be installed on PATH; missing sherpa-onnx-offline-tts
+    is downloaded lazily into XDG user data on supported platforms.
     Each chunk has a 300-second run deadline plus up to 5s for cleanup, which
     reports an unsettled-cleanup error if reaping cannot be established. Subtitle timing
     is exact at chunk boundaries; intra-chunk timing is estimated by the caller.
@@ -178,12 +177,17 @@ def synthesize_local(
         raise LocalTTSError("Local speaker ID is too large to parse") from exc
     if sid >= len(speakers):
         raise LocalTTSError(f"Speaker ID {sid} is unavailable; this model supports 0–{len(speakers) - 1}")
-    executables: list[str] = []
-    for name in ("sherpa-onnx-offline-tts", "ffmpeg"):
-        executable = shutil.which(name)
-        if executable is None:
-            raise LocalTTSError(f"{name} not found on PATH; install the native CLI before using --local-tts")
-        executables.append(executable)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise LocalTTSError("ffmpeg not found on PATH; install FFmpeg before using --local-tts")
+    installed = shutil.which("sherpa-onnx-offline-tts")
+    sherpa = installed or ensure_native()
+    native_env = None
+    if installed is None:
+        native_env = dict(os.environ)
+        existing = native_env.get("LD_LIBRARY_PATH", "")
+        # Termux's release RUNPATH searches the system prefix before $ORIGIN.
+        native_env["LD_LIBRARY_PATH"] = str(Path(sherpa).parent) + (os.pathsep + existing if existing else "")
     output.parent.mkdir(parents=True, exist_ok=True)
     boundaries: list[dict] = []
     total_frames = 0
@@ -197,7 +201,7 @@ def synthesize_local(
                 for index, chunk in enumerate(chunks, 1):
                     print(f"  Local chunk {index}/{len(chunks)} (speaker {sid})", flush=True)
                     wav_path = work / "chunk.wav"
-                    command = [executables[0], "--num-threads=2", f"--sid={sid}", f"--speed={speed}",
+                    command = [sherpa, "--num-threads=2", f"--sid={sid}", f"--speed={speed}",
                                f"--vits-model={model_dir / 'model.onnx'}",
                                f"--vits-lexicon={model_dir / 'lexicon.txt'}",
                                f"--vits-tokens={model_dir / 'tokens.txt'}",
@@ -207,7 +211,7 @@ def synthesize_local(
                     if fsts:
                         command.append("--tts-rule-fsts=" + ",".join(fsts))
                     command.extend(["--", chunk])
-                    _run_process(command)
+                    _run_process(command, env=native_env)
                     with wave.open(str(wav_path), "rb") as source:
                         current_format = (source.getnchannels(), source.getsampwidth(), source.getframerate())
                         if source.getcomptype() != "NONE" or source.getnframes() == 0:
@@ -233,7 +237,7 @@ def synthesize_local(
                             raise LocalTTSError("Native TTS produced truncated WAV audio")
                     wav_path.unlink()
             mp3 = work / "audio.mp3"
-            _run_process([executables[1], "-hide_banner", "-loglevel", "error", "-y", "-i", str(combined),
+            _run_process([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(combined),
                           "-af", f"volume={volume}", "-c:a", "libmp3lame", "-q:a", "4", str(mp3)])
             if mp3.stat().st_size == 0:
                 raise LocalTTSError("FFmpeg produced empty MP3 audio")
