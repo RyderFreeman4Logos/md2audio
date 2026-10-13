@@ -26,6 +26,25 @@ def test_local_options_default_to_melo_speaker_zero_and_double_volume() -> None:
     assert args.local_model is None
     assert args.voice is None
     assert args.volume is None
+    assert args.threads is None
+
+
+@pytest.mark.parametrize("command", ["synth", "bundle"])
+@pytest.mark.parametrize("options,message", [(["--threads", "3"], "requires --local-tts"),
+                                            (["--local-tts", "--threads", "0"], "positive integer"),
+                                            (["--local-tts", "--threads", "-1"], "positive integer"),
+                                            (["--local-tts", "--threads", "1.5"], "invalid int")])
+def test_threads_cli_rejects_invalid_options_before_io(
+    command: str, options: list[str], message: str, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(md2audio, "_resolve", lambda *args: pytest.fail("input IO before validation"))
+    monkeypatch.setattr(md2audio, "fetch_voices", lambda *args: pytest.fail("Edge before validation"))
+    monkeypatch.setattr(sys, "argv", ["md2audio", command, "missing.md", *options])
+    with pytest.raises(SystemExit) as error:
+        md2audio.main()
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("volume", ["0", "0.00", "1", "1.50", "2.35", "1000.00"])
@@ -47,8 +66,9 @@ def test_local_volume_rejects_invalid_values_before_io(volume: str) -> None:
 
 
 @pytest.mark.parametrize("command", ["synth", "bundle"])
+@pytest.mark.parametrize("threads", [None, 3])
 def test_local_cli_routes_offline_with_default_or_selected_gain(
-    command: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    command: str, threads: int | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     source = tmp_path / "input.md"
     output = tmp_path / "audio.mp3"
@@ -56,8 +76,9 @@ def test_local_cli_routes_offline_with_default_or_selected_gain(
     source.write_text("**你好**", encoding="utf-8")
     calls: list[tuple] = []
 
-    def local(text: str, model_dir: Path, speaker: str, speed: float, out: Path, volume: str) -> list[dict]:
-        calls.append((text, model_dir, speaker, speed, out, volume))
+    def local(text: str, model_dir: Path, speaker: str, speed: float, out: Path,
+              volume: str, threads: int | None = None) -> list[dict]:
+        calls.append((text, model_dir, speaker, speed, out, volume, threads))
         out.write_bytes(b"offline")
         return [{"text": text, "offset": 0, "duration": 10_000_000}]
 
@@ -71,12 +92,14 @@ def test_local_cli_routes_offline_with_default_or_selected_gain(
     monkeypatch.setattr(md2audio, "fetch_voices", forbidden)
     monkeypatch.setattr(md2audio, "generate_video", lambda *args: None)
     options = [] if command == "synth" else ["--local-model", "aishell3", "--voice", "7", "--volume", "2.35"]
+    if threads is not None:
+        options += ["--threads", str(threads)]
     monkeypatch.setattr(sys, "argv", ["md2audio", command, str(source), "-o", str(output),
                                     "--local-tts", *options])
     md2audio.main()
 
     assert calls == [("你好", model, "0" if command == "synth" else "7", 1.0,
-                      output, "2.00" if command == "synth" else "2.35")]
+                      output, "2.00" if command == "synth" else "2.35", threads)]
     assert output.read_bytes() == b"offline"
     if command == "bundle":
         assert output.with_suffix(".srt").read_text(encoding="utf-8").endswith("你好\n")
@@ -145,6 +168,7 @@ def test_local_native_cli_chunks_utf8_applies_gain_once_and_writes_real_mp3(
     output = tmp_path / "result.mp3"
     text = "你好，今天的新闻。" + "长" * 900
     source.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {2, 4, 6})
     monkeypatch.setattr(sys, "argv", ["md2audio", str(source), "-o", str(output),
                                     "--local-tts", "--volume", "2.35", "--srt"])
     md2audio.main()
@@ -152,7 +176,7 @@ def test_local_native_cli_chunks_utf8_applies_gain_once_and_writes_real_mp3(
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert "".join(call[-1] for call in calls) == text
     assert all(len(call[-1]) <= 400 for call in calls)
-    assert all("--sid=0" in call and "--num-threads=2" in call for call in calls)
+    assert all("--sid=0" in call and "--num-threads=3" in call for call in calls)
     assert all(f"--vits-model={model / 'model.onnx'}" in call for call in calls)
     assert all(f"--tts-rule-fsts={model / 'date.fst'},{model / 'number.fst'}" in call for call in calls)
     decoded = subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-f", "s16le", "-"],
@@ -164,6 +188,46 @@ def test_local_native_cli_chunks_utf8_applies_gain_once_and_writes_real_mp3(
         "1\n00:00:00,000 --> "
     )
     assert not list(tmp_path.glob(".result.*"))
+
+
+@pytest.mark.parametrize("affinity,cpus,threads,expected", [({2, 4, 6}, 64, None, 3),
+                                                        ({2, 4, 6}, 64, 5, 5),
+                                                        (None, 7, None, 7),
+                                                        (None, None, None, 1),
+                                                        (None, 0, None, 1),
+                                                        (set(), 7, None, 1)])
+def test_local_threads_use_available_cpus_or_explicit_override(
+    native_tts: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    affinity: set[int] | None, cpus: int | None, threads: int | None, expected: int,
+) -> None:
+    from md2audio_local import synthesize_local
+    model, log = native_tts
+
+    def available(pid: int) -> set[int]:
+        if affinity is None:
+            raise OSError("affinity unavailable")
+        return affinity
+
+    if affinity is None and cpus is None:
+        monkeypatch.delattr(os, "sched_getaffinity")
+    else:
+        monkeypatch.setattr(os, "sched_getaffinity", available)
+    monkeypatch.setattr(os, "cpu_count", lambda: cpus)
+    synthesize_local("你好。", model, "0", 1.0, tmp_path / "result.mp3", threads=threads)
+    assert f"--num-threads={expected}" in json.loads(log.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("threads", [0, -1, True, 1.5, "3"])
+def test_local_invalid_threads_are_rejected_before_setup_or_output(
+    threads: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import md2audio_local
+    output = tmp_path / "missing-parent" / "audio.mp3"
+    monkeypatch.setattr(md2audio_local, "ensure_native", lambda: pytest.fail("native setup before validation"))
+    with pytest.raises(md2audio_local.LocalTTSError, match="threads.*positive integer"):
+        md2audio_local.synthesize_local("你好。", tmp_path / "missing-model", "0", 1.0,
+                                       output, threads=threads)
+    assert not output.parent.exists()
 
 
 def test_local_missing_path_runtime_is_prepared_lazily_and_invoked_directly(

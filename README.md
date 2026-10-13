@@ -67,7 +67,10 @@ md2audio input.txt --local-tts --local-model aishell3 --voice 10 \
   --volume 2.35 --speed 1.10 --srt -o another-voice.mp3
 ```
 
-`--local-model` and `--volume` require `--local-tts`. Without `--local-tts`,
+Local TTS defaults to all CPUs available to the process (respecting CPU affinity).
+Override with a positive `--threads N`, for example `--local-tts --threads 4`;
+use `--threads 1` to limit CPU use. Serial stages may not use all cores.
+`--local-model`, `--volume`, and `--threads` require `--local-tts`. Without `--local-tts`,
 synthesis uses Edge. Local synthesis never contacts Edge or falls back to it
 on failure. Large volume gains can clip. Downloaded archives and cached asset
 files are checked against pinned sizes and SHA256 hashes; if existing cached
