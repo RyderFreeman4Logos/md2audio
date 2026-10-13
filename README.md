@@ -18,43 +18,52 @@ md2audio bundle input.md
 
 ## Offline TTS on Termux
 
-Pass `--local-tts MODEL_DIR` to use a downloaded sherpa-onnx VITS model.
-Without that argument, synthesis continues to use Edge. Local synthesis never
-contacts Edge or falls back to it after an error.
+Add the plain `--local-tts` flag to use free offline TTS:
+
+```bash
+md2audio input.txt --local-tts -o output.mp3
+```
+
+On the first local synthesis, md2audio downloads the default Melo Chinese-English
+model (about 167 MB) into `$XDG_DATA_HOME/md2audio/models/vits-melo-tts-zh_en`.
+If `XDG_DATA_HOME` is unset, empty, or relative, it uses
+`~/.local/share/md2audio/models/` instead. Installation, imports, `--help`, and
+Edge synthesis do not download models or touch this data directory. Later local
+runs verify and reuse the cached model without network access. Failed downloads
+leave the requested MP3 intact and can be retried with the same command.
 
 Install `ffmpeg` and `libc++` in Termux, and put the native
 `sherpa-onnx-offline-tts` executable on `PATH`. The
 [sherpa-onnx v1.13.8 release](https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.8)
 provides `sherpa-onnx-v1.13.8-android-aarch64-termux-static.tar.bz2` for native
-ARM64 Termux; Linux ARM64 binaries do not run directly on Android.
-The model directory must contain `model.onnx`, `lexicon.txt`, and `tokens.txt`.
-Bundled `phone.fst`, `date.fst`, and `number.fst` are used when present.
+ARM64 Termux; Linux ARM64 binaries do not run directly on Android. These native
+tools must be installed before first use; md2audio downloads models only.
 
-The free [Melo Chinese-English VITS model](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/vits.html)
-(`vits-melo-tts-zh_en`) has one voice. Omit `--voice` to retain speaker 0:
-
-```bash
-md2audio news.txt -o news.mp3 \
-  --local-tts ~/md2audio-tts-trial-20261013/vits-melo-tts-zh_en
-```
-
-Local volume defaults to `2.00`, doubling sample amplitude once during MP3
-encoding. Override it with `--volume`, using a nonnegative decimal with at most
-two decimal places, such as `0.00`, `1.50`, or `2.35`. Large gains can clip.
-`--volume` requires `--local-tts` and does not change Edge volume.
-
-For more voices, use the free `vits-icefall-zh-aishell3` model from the same
-upstream model collection. Its `speakers.txt` lists 174 voices in ID order,
-0–173; `--voice` selects that numeric ID in local mode. This smaller model
-outputs 8 kHz audio, so its bandwidth differs from Melo's 44.1 kHz output.
-Without `speakers.txt`, md2audio accepts only ID 0 rather than allowing sherpa
-to silently substitute speaker 0 for an invalid ID.
+The default [Melo Chinese-English VITS model](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/vits.html)
+has one voice. Omit `--voice` to retain speaker 0. Local volume defaults to
+`2.00`, doubling sample amplitude once during MP3 encoding. Override it with
+`--volume`, using a nonnegative decimal with at most two decimal places:
 
 ```bash
-md2audio news.txt -o another-voice.mp3 \
-  --local-tts ~/md2audio-tts-trial-20261013/vits-icefall-zh-aishell3 \
-  --voice 10 --volume 2.35 --speed 1.10 --srt
+md2audio input.txt --local-tts --volume 1.50 -o output.mp3
 ```
+
+For more voices, select the free AISHELL3 model with `--local-model aishell3`.
+Its first use downloads about 32 MB into the same XDG models directory, under
+`vits-icefall-zh-aishell3`. It has 174 voices, selected by numeric `--voice` IDs
+0–173; speaker 0 remains the default. This model outputs 8 kHz audio, compared
+to Melo's 44.1 kHz output.
+
+```bash
+md2audio input.txt --local-tts --local-model aishell3 --voice 10 \
+  --volume 2.35 --speed 1.10 --srt -o another-voice.mp3
+```
+
+`--local-model` and `--volume` require `--local-tts`. Without `--local-tts`,
+synthesis uses Edge. Local synthesis never contacts Edge or falls back to it
+on failure. Large volume gains can clip. Downloaded archives and cached model
+files are checked against pinned sizes and SHA256 hashes; if existing cached
+data is corrupt, md2audio reports its path and preserves it for manual recovery.
 
 Local mode supports `synth`, `bundle`, subtitles, and video, but currently
 rejects `--multi-speaker`. It groups text at sentence breaks into chunks of at
