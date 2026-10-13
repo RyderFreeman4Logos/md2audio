@@ -1,9 +1,10 @@
-"""Convert markdown files to audio (and optionally subtitles/video) via edge-tts."""
+"""Convert Markdown to audio, subtitles, and video with Edge or explicit offline TTS."""
 
 import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -673,14 +674,25 @@ def generate_video(audio: Path, video: Path, srt: Path | None = None) -> None:
 # CLI helpers
 # ---------------------------------------------------------------------------
 
+def _volume_multiplier(value: str) -> str:
+    """Validate a decimal gain without rounding it through a binary float."""
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]{1,2})?", value) is None:
+        raise argparse.ArgumentTypeError("volume must be nonnegative with at most two decimal places")
+    return value
+
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     """Register arguments shared by synth and bundle subcommands."""
     p.add_argument("input", type=Path, help="Input file (markdown or plain text)")
     p.add_argument("-o", "--output", type=Path,
                    help="Output audio file (default: ~/w/<stem>.mp3)")
     g = p.add_argument_group("TTS")
+    g.add_argument("--local-tts", type=Path, metavar="MODEL_DIR",
+                   help="Use offline sherpa-onnx VITS from this model directory (default: Edge)")
     g.add_argument("--voice",
-                   help=f"Voice (default: {DEFAULT_VOICE})")
+                   help=f"Edge voice (default: {DEFAULT_VOICE}); local mode: speaker ID (default: 0)")
+    g.add_argument("--volume", type=_volume_multiplier, metavar="MULTIPLIER",
+                   help="Local mode only: nonnegative volume multiplier, up to two decimals (default: 2.00)")
     g.add_argument("--speed", type=float, default=DEFAULT_SPEED,
                    help=f"Speed multiplier (default: {DEFAULT_SPEED})")
     g = p.add_argument_group("Processing")
@@ -813,6 +825,20 @@ def _validate_multi_speaker_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("automatic multi-speaker mode needs exactly one of --speaker-locale or --speaker-language")
 
 
+def _validate_local_tts_args(args, parser: argparse.ArgumentParser) -> None:
+    """Reject local-only options and unsupported combinations before input IO."""
+    if args.local_tts is None:
+        if args.volume is not None:
+            parser.error("--volume requires --local-tts")
+        return
+    if args.multi_speaker:
+        parser.error("--local-tts does not support --multi-speaker")
+    if args.voice is not None and re.fullmatch(r"[0-9]+", args.voice) is None:
+        parser.error("local --voice must be a nonnegative numeric speaker ID")
+    if not math.isfinite(args.speed) or args.speed <= 0:
+        parser.error("local --speed must be finite and greater than zero")
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -856,12 +882,21 @@ def _cmd_synth(args) -> None:
     out, text = _resolve(args)
     srt_out = out.with_suffix(".srt") if args.srt else None
 
-    voice = args.voice or DEFAULT_VOICE
+    local_dir = getattr(args, "local_tts", None)
+    voice = args.voice or ("0" if local_dir is not None else DEFAULT_VOICE)
     print(f"Voice:  {voice} @ {args.speed}x")
     print(f"Output: {out}")
     print("Synthesizing..." + (" (with subtitles)" if srt_out else ""))
 
-    bounds = synthesize(text, voice, args.speed, out)
+    if local_dir is not None:
+        from md2audio_local import synthesize_local
+        try:
+            bounds = synthesize_local(text, local_dir, voice, args.speed, out, args.volume or "2.00")
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        bounds = synthesize(text, voice, args.speed, out)
     print(f"Audio:  {out.stat().st_size / (1024 * 1024):.1f} MB")
 
     if srt_out:
@@ -924,14 +959,23 @@ def _cmd_bundle(args) -> None:
     srt_path = out.with_suffix(".srt")
     vid_path = out.with_suffix(".mp4")
 
-    voice = args.voice or DEFAULT_VOICE
+    local_dir = getattr(args, "local_tts", None)
+    voice = args.voice or ("0" if local_dir is not None else DEFAULT_VOICE)
     print(f"Voice:  {voice} @ {args.speed}x")
     print(f"Audio:  {out}")
     print(f"SRT:    {srt_path}")
     print(f"Video:  {vid_path}")
 
     print("\n[1/3] Synthesizing audio...")
-    bounds = synthesize(text, voice, args.speed, out)
+    if local_dir is not None:
+        from md2audio_local import synthesize_local
+        try:
+            bounds = synthesize_local(text, local_dir, voice, args.speed, out, args.volume or "2.00")
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        bounds = synthesize(text, voice, args.speed, out)
     print(f"  {out.stat().st_size / (1024 * 1024):.1f} MB")
 
     print("\n[2/3] Generating subtitles...")
@@ -976,6 +1020,7 @@ def main() -> None:
 
     args = top.parse_args()
     if args.command is not None:
+        _validate_local_tts_args(args, top)
         _validate_multi_speaker_args(args, top)
     if args.command == "synth":
         _cmd_synth(args)
