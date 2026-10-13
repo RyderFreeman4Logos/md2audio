@@ -263,6 +263,13 @@ def ensure_native() -> str:
     return str(directory / "sherpa-onnx-offline-tts")
 
 
+def _validate_library_directory(directory: Path) -> None:
+    """Require a canonical directory that dynamic loaders can represent literally."""
+    if any(character in str(directory) for character in (":", ";", "$")):
+        raise LocalTTSError(f"Native cache directory cannot be represented in the child library search path: {directory}; "
+                            "':' and ';' separate directories, and '$' expands loader tokens")
+
+
 def _ensure_asset(top: str, archive_size: int, archive_hash: str, expanded_limit: int,
                   files: dict[str, tuple[int, str]], *, category: str, release: str,
                   executable: str | None = None) -> Path:
@@ -272,9 +279,8 @@ def _ensure_asset(top: str, archive_size: int, archive_hash: str, expanded_limit
     data_home = Path(value) if value and Path(value).is_absolute() else Path.home() / ".local/share"
     try:
         root = _safe_directory(data_home / "md2audio" / category)
-        if executable and any(character in str(root) for character in (":", ";", "$")):
-            raise LocalTTSError(f"Native cache directory cannot be represented in the child library search path: {root}; "
-                                "':' and ';' separate directories, and '$' expands loader tokens")
+        if executable:
+            _validate_library_directory(root)
         lock_fd = os.open(root / f".{top}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(lock_fd, "rb") as lock:
             metadata = os.fstat(lock.fileno())
@@ -292,6 +298,8 @@ def _ensure_asset(top: str, archive_size: int, archive_hash: str, expanded_limit
             directory = root / top
             if directory.exists() or directory.is_symlink():
                 directory = _safe_directory(directory)
+                if executable:
+                    _validate_library_directory(directory)
                 try:
                     _verify_files(directory, files, executable)
                 except (OSError, LocalTTSError) as exc:

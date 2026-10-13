@@ -240,6 +240,35 @@ def test_native_cache_directory_must_be_representable_in_child_library_search_pa
     assert not list(real.glob("md2audio/native/.test-runtime*"))
 
 
+@pytest.mark.parametrize("suffix", ["safe", ":", ";", "$ORIGIN"])
+def test_cached_native_version_symlink_validates_its_final_library_directory(
+    native, tmp_path, monkeypatch, suffix,
+) -> None:
+    original = Path(md2audio_models.ensure_native()).parent
+    target = tmp_path / ("private" + suffix + "runtime")
+    original.rename(target)
+    original.symlink_to(target, target_is_directory=True)
+
+    def snapshot():
+        result = {}
+        for path in [original, target, *target.iterdir()]:
+            metadata = path.lstat()
+            result[str(path)] = (metadata.st_ino, metadata.st_mode, metadata.st_size,
+                                 metadata.st_mtime_ns, metadata.st_ctime_ns,
+                                 path.read_bytes() if path.is_file() else None)
+        return result
+
+    before = snapshot()
+    monkeypatch.setattr(md2audio_models, "build_opener", lambda *args: pytest.fail("Cached symlink contacted network"))
+    if suffix == "safe":
+        assert md2audio_models.ensure_native() == str(target / "sherpa-onnx-offline-tts")
+    else:
+        with pytest.raises(RuntimeError, match="library search path"):
+            md2audio_models.ensure_native()
+    assert snapshot() == before and original.is_symlink()
+    assert len(native[2]) == 1
+
+
 def test_native_failed_acquisition_keeps_original_cli_mp3(tmp_path, monkeypatch) -> None:
     import md2audio
     source = tmp_path / "input.md"
