@@ -20,9 +20,10 @@ import md2audio
 def test_local_options_default_to_melo_speaker_zero_and_double_volume() -> None:
     parser = argparse.ArgumentParser()
     md2audio._add_common(parser)
-    args = parser.parse_args(["input.md", "--local-tts", "models/melo"])
+    args = parser.parse_args(["--local-tts", "input.md"])
 
-    assert args.local_tts == Path("models/melo")
+    assert args.local_tts is True
+    assert args.local_model is None
     assert args.voice is None
     assert args.volume is None
 
@@ -31,7 +32,7 @@ def test_local_options_default_to_melo_speaker_zero_and_double_volume() -> None:
 def test_local_volume_accepts_nonnegative_values_with_two_decimal_places(volume: str) -> None:
     parser = argparse.ArgumentParser()
     md2audio._add_common(parser)
-    args = parser.parse_args(["input.md", "--local-tts", "models/melo", "--volume", volume])
+    args = parser.parse_args(["input.md", "--local-tts", "--volume", volume])
 
     assert args.volume == volume
 
@@ -41,7 +42,7 @@ def test_local_volume_rejects_invalid_values_before_io(volume: str) -> None:
     parser = argparse.ArgumentParser()
     md2audio._add_common(parser)
     with pytest.raises(SystemExit) as error:
-        parser.parse_args(["input.md", "--local-tts", "models/melo", "--volume", volume])
+        parser.parse_args(["input.md", "--local-tts", "--volume", volume])
     assert error.value.code == 2
 
 
@@ -63,13 +64,15 @@ def test_local_cli_routes_offline_with_default_or_selected_gain(
     def forbidden(*args, **kwargs):
         pytest.fail("local CLI contacted Edge")
 
-    monkeypatch.setitem(sys.modules, "md2audio_local", SimpleNamespace(synthesize_local=local))
+    monkeypatch.setitem(sys.modules, "md2audio_local", SimpleNamespace(synthesize_local=local, LocalTTSError=RuntimeError))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=lambda name: model))
+    monkeypatch.setattr(md2audio.shutil, "which", lambda name: "/fixture/" + name)
     monkeypatch.setattr(md2audio, "synthesize", forbidden)
     monkeypatch.setattr(md2audio, "fetch_voices", forbidden)
     monkeypatch.setattr(md2audio, "generate_video", lambda *args: None)
-    options = [] if command == "synth" else ["--voice", "7", "--volume", "2.35"]
+    options = [] if command == "synth" else ["--local-model", "aishell3", "--voice", "7", "--volume", "2.35"]
     monkeypatch.setattr(sys, "argv", ["md2audio", command, str(source), "-o", str(output),
-                                    "--local-tts", str(model), *options])
+                                    "--local-tts", *options])
     md2audio.main()
 
     assert calls == [("你好", model, "0" if command == "synth" else "7", 1.0,
@@ -80,10 +83,10 @@ def test_local_cli_routes_offline_with_default_or_selected_gain(
 
 
 @pytest.mark.parametrize("options", [["--volume", "1.50"],
-                                    ["--local-tts", "melo", "--multi-speaker"],
-                                    ["--local-tts", "melo", "--voice", "Yunxi"],
-                                    ["--local-tts", "melo", "--speed", "nan"],
-                                    ["--local-tts", "melo", "--speed", "0"]])
+                                    ["--local-tts", "--multi-speaker"],
+                                    ["--local-tts", "--voice", "Yunxi"],
+                                    ["--local-tts", "--speed", "nan"],
+                                    ["--local-tts", "--speed", "0"]])
 def test_local_cli_rejects_incompatible_selectors_before_input_io(
     options: list[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -127,6 +130,7 @@ if os.environ.get("TTS_TEST_TRUNCATE"):
     executable.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("TTS_TEST_LOG", str(log))
+    monkeypatch.setitem(sys.modules, "md2audio_models", SimpleNamespace(ensure_model=lambda name: model))
     return model, log
 
 
@@ -139,7 +143,7 @@ def test_local_native_cli_chunks_utf8_applies_gain_once_and_writes_real_mp3(
     text = "你好，今天的新闻。" + "长" * 900
     source.write_text(text, encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["md2audio", str(source), "-o", str(output),
-                                    "--local-tts", str(model), "--volume", "2.35", "--srt"])
+                                    "--local-tts", "--volume", "2.35", "--srt"])
     md2audio.main()
 
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
@@ -475,7 +479,7 @@ def test_local_paragraph_subtitles_keep_all_text_in_valid_cues(
     output = tmp_path / "paragraphs.mp3"
     text = "第一段。\n\n第二段。\n\n第三段。"
     source.write_text(text, encoding="utf-8")
-    monkeypatch.setattr(sys, "argv", ["md2audio", str(source), "--local-tts", str(model),
+    monkeypatch.setattr(sys, "argv", ["md2audio", str(source), "--local-tts",
                                     "-o", str(output), "--srt"])
     md2audio.main()
     cues = re.split(r"\n\s*\n", output.with_suffix(".srt").read_text().strip())

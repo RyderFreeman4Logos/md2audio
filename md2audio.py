@@ -687,8 +687,10 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("-o", "--output", type=Path,
                    help="Output audio file (default: ~/w/<stem>.mp3)")
     g = p.add_argument_group("TTS")
-    g.add_argument("--local-tts", type=Path, metavar="MODEL_DIR",
-                   help="Use offline sherpa-onnx VITS from this model directory (default: Edge)")
+    g.add_argument("--local-tts", action="store_true",
+                   help="Use offline TTS; download the model to XDG data on first use (default: Edge)")
+    g.add_argument("--local-model", choices=("melo", "aishell3"),
+                   help="Local model: melo (default, one voice) or aishell3 (174 voices)")
     g.add_argument("--voice",
                    help=f"Edge voice (default: {DEFAULT_VOICE}); local mode: speaker ID (default: 0)")
     g.add_argument("--volume", type=_volume_multiplier, metavar="MULTIPLIER",
@@ -827,9 +829,11 @@ def _validate_multi_speaker_args(args, parser: argparse.ArgumentParser) -> None:
 
 def _validate_local_tts_args(args, parser: argparse.ArgumentParser) -> None:
     """Reject local-only options and unsupported combinations before input IO."""
-    if args.local_tts is None:
+    if not args.local_tts:
         if args.volume is not None:
             parser.error("--volume requires --local-tts")
+        if args.local_model is not None:
+            parser.error("--local-model requires --local-tts")
         return
     if args.multi_speaker:
         parser.error("--local-tts does not support --multi-speaker")
@@ -837,6 +841,28 @@ def _validate_local_tts_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("local --voice must be a nonnegative numeric speaker ID")
     if not math.isfinite(args.speed) or args.speed <= 0:
         parser.error("local --speed must be finite and greater than zero")
+    if args.voice is not None:
+        try:
+            sid = int(args.voice)
+        except ValueError:
+            parser.error("local --voice is too large to parse")
+        speakers = 174 if args.local_model == "aishell3" else 1
+        if sid >= speakers:
+            parser.error(f"local model {args.local_model or 'melo'} supports speaker IDs 0–{speakers - 1}")
+
+
+def _local_model_for_input(args, text: str) -> Path:
+    """Validate local input and installed tools before any model download or data IO."""
+    from md2audio_local import LocalTTSError
+    if "\x00" in text:
+        raise LocalTTSError("Input contains a NUL character; remove it before local synthesis")
+    if not text.strip():
+        raise LocalTTSError("Input contains no speakable text")
+    for name in ("sherpa-onnx-offline-tts", "ffmpeg"):
+        if shutil.which(name) is None:
+            raise LocalTTSError(f"{name} not found on PATH; install the native CLI before using --local-tts")
+    from md2audio_models import ensure_model
+    return ensure_model(args.local_model or "melo")
 
 
 # ---------------------------------------------------------------------------
@@ -882,16 +908,17 @@ def _cmd_synth(args) -> None:
     out, text = _resolve(args)
     srt_out = out.with_suffix(".srt") if args.srt else None
 
-    local_dir = getattr(args, "local_tts", None)
-    voice = args.voice or ("0" if local_dir is not None else DEFAULT_VOICE)
+    local = getattr(args, "local_tts", False)
+    voice = args.voice or ("0" if local else DEFAULT_VOICE)
     print(f"Voice:  {voice} @ {args.speed}x")
     print(f"Output: {out}")
     print("Synthesizing..." + (" (with subtitles)" if srt_out else ""))
 
-    if local_dir is not None:
+    if local:
         from md2audio_local import synthesize_local
         try:
-            bounds = synthesize_local(text, local_dir, voice, args.speed, out, args.volume or "2.00")
+            model_dir = _local_model_for_input(args, text)
+            bounds = synthesize_local(text, model_dir, voice, args.speed, out, args.volume or "2.00")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -959,18 +986,19 @@ def _cmd_bundle(args) -> None:
     srt_path = out.with_suffix(".srt")
     vid_path = out.with_suffix(".mp4")
 
-    local_dir = getattr(args, "local_tts", None)
-    voice = args.voice or ("0" if local_dir is not None else DEFAULT_VOICE)
+    local = getattr(args, "local_tts", False)
+    voice = args.voice or ("0" if local else DEFAULT_VOICE)
     print(f"Voice:  {voice} @ {args.speed}x")
     print(f"Audio:  {out}")
     print(f"SRT:    {srt_path}")
     print(f"Video:  {vid_path}")
 
     print("\n[1/3] Synthesizing audio...")
-    if local_dir is not None:
+    if local:
         from md2audio_local import synthesize_local
         try:
-            bounds = synthesize_local(text, local_dir, voice, args.speed, out, args.volume or "2.00")
+            model_dir = _local_model_for_input(args, text)
+            bounds = synthesize_local(text, model_dir, voice, args.speed, out, args.volume or "2.00")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
