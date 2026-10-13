@@ -555,3 +555,44 @@ def test_model_import_does_not_create_or_read_xdg_data(tmp_path, monkeypatch) ->
                             capture_output=True, timeout=5)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert data.read_bytes() == b"untouched"
+
+
+@pytest.mark.parametrize("mask", [0o002, 0o000])
+@pytest.mark.parametrize("model", ["melo", "aishell3"])
+def test_new_model_files_are_private_under_writable_umask_and_reused_offline(
+    models, tmp_path: Path, mask: int, model: str,
+) -> None:
+    import json
+    module, data, payload, _ = models
+    archive = tmp_path / "fixture.tar.bz2"
+    archive.write_bytes(payload)
+    script = """
+import io, json, os, stat, sys
+from pathlib import Path
+from types import SimpleNamespace
+import md2audio_models
+md2audio_models._MODELS = json.loads(sys.argv[1])
+archive = Path(sys.argv[2]).read_bytes()
+mask = int(sys.argv[3])
+model = sys.argv[4]
+downloads = []
+def download(url, timeout):
+    downloads.append(url)
+    return io.BytesIO(archive)
+md2audio_models.build_opener = lambda *args: SimpleNamespace(open=download)
+os.umask(mask)
+first = md2audio_models.ensure_model(model)
+assert len(downloads) == 1
+assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in first.iterdir())
+def offline(*args):
+    raise AssertionError('Network attempted during cached reuse')
+md2audio_models.build_opener = offline
+assert md2audio_models.ensure_model(model) == first
+assert os.umask(mask) == mask, 'Model installation changed the process umask'
+print(first)
+"""
+    result = subprocess.run([sys.executable, "-c", script, json.dumps(module._MODELS),
+                             str(archive), str(mask), model], capture_output=True, timeout=5)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    directory = Path(result.stdout.decode().strip().splitlines()[-1])
+    assert {name: (directory / name).read_bytes() for name in data} == data

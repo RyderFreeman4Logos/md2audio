@@ -181,6 +181,7 @@ def _extract(archive: Path, destination: Path, top: str, expanded_limit: int,
             if stream is None:
                 raise LocalTTSError(f"Missing model archive data: {member.name}")
             with stream, (destination / name.name).open("xb") as target:
+                os.fchmod(target.fileno(), 0o600)
                 remaining = member.size
                 while remaining:
                     if time.monotonic() >= deadline:
