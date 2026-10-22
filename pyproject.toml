@@ -6,7 +6,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-    "edge-tts>=7.0",
+    "edge-tts>=7.3.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
 
