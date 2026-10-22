@@ -9,6 +9,26 @@ uv sync --extra dev
 uv run md2audio input.md -o input.mp3
 ```
 
+Install the command with uv. Do not pass `--constraints` or `--with edge-tts==...`:
+an exact receipt pin is kept by `uv tool upgrade` and blocks later stable releases.
+
+```bash
+uv tool install "md2audio @ git+https://github.com/RyderFreeman4Logos/md2audio.git"
+```
+
+Edge TTS 7.2.x is rejected (`edge-tts>=7.3.0`). Releases inside that floor,
+including a newer 7.3.x, resolve on install. `uv tool upgrade md2audio` moves
+them only when the receipt has no exact `constraints` or `--with` pin. An
+existing pinned install does not update by itself; replace that receipt once:
+
+```bash
+uv tool install --force --upgrade "md2audio @ git+https://github.com/RyderFreeman4Logos/md2audio.git"
+```
+
+There is no background updater. Later releases still require that install or
+upgrade command. A `PYTHONPATH` entry that contains another `edge-tts` is
+imported first and is outside this package constraint.
+
 The default single-speaker workflow remains unchanged:
 
 ```bash
