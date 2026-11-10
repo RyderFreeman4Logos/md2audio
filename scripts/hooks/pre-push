@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Installed through `just install-hooks`; a missing executor must block the push.
+set -euo pipefail
+
+case "${LEFTHOOK:-}" in
+  ""|1|true) ;;
+  *) echo "Push blocked: LEFTHOOK must not disable required gates" >&2; exit 1 ;;
+esac
+
+if [[ -n "${LEFTHOOK_CONFIG:-}" || -n "${LEFTHOOK_EXCLUDE:-}" ]]; then
+  echo "Push blocked: LEFTHOOK_CONFIG and LEFTHOOK_EXCLUDE must not override required gates" >&2
+  exit 1
+fi
+
+exec "${LEFTHOOK_BIN:-lefthook}" run pre-push "$@"
