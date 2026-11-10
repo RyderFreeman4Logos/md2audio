@@ -184,8 +184,8 @@ an interruption to resume from completed turns instead of starting over.
 Multi-speaker MP3 output is an atomic binary concatenation of the MP3 frames
 returned by Edge TTS. This assumes Edge returns the same MP3 encoding for each
 request, and adds no `ffmpeg` dependency for audio-only output. Subtitle
-boundaries are shifted by the preceding turns' actual boundary duration; when
-a turn has no boundaries, `md2audio` falls back to its MP3 frame duration.
+boundaries are shifted by the preceding turns' MP3 frame duration. When that
+duration is unavailable, `md2audio` falls back to the final subtitle boundary.
 
 ## Verification
 
