@@ -628,7 +628,7 @@ def generate_video(audio: Path, video: Path, srt: Path | None = None) -> None:
         "[0:a]showwaves=s=1280x720:mode=cline:rate=30"
         ":colors=0x4a90d9@0.8|0x7ec8e3@0.6:scale=sqrt[waves];"
         "color=c=0x1a1a2e:s=1280x720:r=30[bg];"
-        "[bg][waves]overlay=format=auto,format=yuv420p[v]"
+        "[bg][waves]overlay=shortest=1:format=auto,format=yuv420p[v]"
     )
 
     codecs_to_try = [_CODEC_NVENC, _CODEC_X264] if _nvenc_available() else [_CODEC_X264]
