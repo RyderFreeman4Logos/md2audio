@@ -189,6 +189,9 @@ duration is unavailable, `md2audio` falls back to the final subtitle boundary.
 
 ## Verification
 
+For development, run `just install-hooks` after cloning. This selects the tracked
+pre-push hook, which fails closed when Lefthook is unavailable.
+
 Tests mock Edge calls and exercise local synthesis with a deterministic native
 CLI fixture plus the real FFmpeg executable. They do not use the network or
 require a downloaded ONNX model; `ffmpeg` must be installed:
